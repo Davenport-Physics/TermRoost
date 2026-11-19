@@ -2,14 +2,23 @@
 //!
 //! ```text
 //! cargo xtask package [deb|rpm|all|windows]   build release packages into dist/
+//! cargo xtask remote                           build the static helper for remote hosts
 //! ```
+//!
+//! `remote` builds `terminalrooster-remote` for Linux with musl, linked
+//! statically, so it runs on any Linux host of this processor whatever its C
+//! library (`target/<processor>-unknown-linux-musl/release/`, where Terminal
+//! Rooster finds it to copy to hosts). It needs the Rust target
+//! (`rustup target add x86_64-unknown-linux-musl`) and a C compiler for the
+//! bundled SQLite: `musl-gcc` (Debian/Ubuntu `musl-tools`), else `clang`.
 //!
 //! With no format, Windows builds the installer and other systems build the
 //! `.deb` and `.rpm` (`all`).
 //!
-//! Linux packaging builds the release binary, stages every installed file under
-//! `target/release/packaging-root/` (binary, desktop entry, AppStream metadata and the
-//! hicolor icons from `packaging/icons/`), then runs `cargo deb`
+//! Linux packaging builds the release binary and the static helper for remote
+//! hosts, stages every installed file under `target/release/packaging-root/`
+//! (binary, helper, desktop entry, AppStream metadata and the hicolor icons
+//! from `packaging/icons/`), then runs `cargo deb`
 //! and `cargo generate-rpm`, whose file lists live in
 //! `crates/termroost-iced/Cargo.toml`.
 //!
@@ -32,8 +41,9 @@ fn main() -> ExitCode {
         ["package", "deb"] => package(true, false),
         ["package", "rpm"] => package(false, true),
         ["package", "windows"] => package_windows(),
+        ["remote"] => build_remote().map(drop),
         _ => {
-            eprintln!("usage: cargo xtask package [deb|rpm|all|windows]");
+            eprintln!("usage: cargo xtask package [deb|rpm|all|windows] | cargo xtask remote");
             return ExitCode::from(2);
         }
     };
@@ -102,7 +112,8 @@ fn package(deb: bool, rpm: bool) -> Result<()> {
     }
 
     run(cargo().args(["build", "--release", "--locked", "-p", "termroost-iced"]))?;
-    stage(&root)?;
+    let helper = build_remote()?;
+    stage(&root, &helper)?;
 
     let dist = root.join("dist");
     std::fs::create_dir_all(&dist).map_err(|e| e.to_string())?;
@@ -179,8 +190,41 @@ fn version_quad(version: &str) -> Result<String> {
     Ok(format!("{core}.0"))
 }
 
+/// Builds the helper for remote hosts statically for Linux with musl (see the
+/// module docs) and returns where it is.
+fn build_remote() -> Result<PathBuf> {
+    let arch = std::env::consts::ARCH;
+    let triple = format!("{arch}-unknown-linux-musl");
+    let installed = Command::new("rustup").args(["target", "list", "--installed"]).output();
+    if installed.is_ok_and(|o| !String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim() == triple)) {
+        return Err(format!("the Rust target {triple} is missing; run: rustup target add {triple}"));
+    }
+    let on_path = |tool: &str| Command::new(tool).arg("--version").output().is_ok_and(|o| o.status.success());
+    let env_key = triple.replace('-', "_");
+    let mut build = cargo();
+    build.args(["build", "--release", "--locked", "-p", "termroost-remote", "--target", &triple]);
+    if !on_path("musl-gcc") {
+        if !on_path("clang") {
+            return Err("no C compiler for musl: install musl-gcc (musl-tools) or clang".into());
+        }
+        // clang builds SQLite against this system's headers: without asking
+        // for the `open64`-style names, which musl doesn't have (and 64-bit
+        // Linux doesn't need).
+        build.env(format!("CC_{env_key}"), "clang");
+        build.env(format!("CFLAGS_{env_key}"), "-DSQLITE_DISABLE_LFS");
+        if on_path("llvm-ar") {
+            build.env(format!("AR_{env_key}"), "llvm-ar");
+        }
+    }
+    run(&mut build)?;
+    let built = root().join("target").join(&triple).join("release/terminalrooster-remote");
+    eprintln!("static helper for remote hosts: {}", built.display());
+    Ok(built)
+}
+
 /// Lays out every installed file under `target/release/packaging-root`.
-fn stage(root: &Path) -> Result<()> {
+/// `helper`: the static helper for remote hosts.
+fn stage(root: &Path, helper: &Path) -> Result<()> {
     let stage = root.join("target/release/packaging-root");
     if stage.exists() {
         std::fs::remove_dir_all(&stage).map_err(|e| e.to_string())?;
@@ -193,6 +237,9 @@ fn stage(root: &Path) -> Result<()> {
     };
     let exe = if cfg!(windows) { "terminalrooster.exe" } else { "terminalrooster" };
     copy(root.join("target/release").join(exe), "usr/bin/terminalrooster")?;
+    // Where Terminal Rooster looks for it (see termroost_core::remote::bootstrap).
+    let arch = std::env::consts::ARCH;
+    copy(helper.to_path_buf(), &format!("usr/lib/terminalrooster/terminalrooster-remote-linux-{arch}"))?;
     copy(root.join(format!("packaging/linux/{APP_ID}.desktop")), &format!("usr/share/applications/{APP_ID}.desktop"))?;
     copy(
         root.join(format!("packaging/linux/{APP_ID}.metainfo.xml")),

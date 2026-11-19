@@ -60,6 +60,7 @@ depends = "$auto, libxkbcommon0"
 recommends = "libvulkan1, libwayland-client0"
 assets = [
     ["target/release/packaging-root/usr/bin/terminalrooster", "usr/bin/", "755"],
+    ["target/release/packaging-root/usr/lib/terminalrooster/terminalrooster-remote-linux-x86_64", "usr/lib/terminalrooster/", "755"],
     ["target/release/packaging-root/usr/share/applications/io.github.Davenport_Physics.TerminalRooster.desktop", "usr/share/applications/", "644"],
     ["target/release/packaging-root/usr/share/metainfo/io.github.Davenport_Physics.TerminalRooster.metainfo.xml", "usr/share/metainfo/", "644"],
     ["target/release/packaging-root/usr/share/icons/hicolor/16x16/apps/io.github.Davenport_Physics.TerminalRooster.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
@@ -81,6 +82,7 @@ summary = "Project-based terminals for running coding agents side by side"
 url = "https://github.com/Davenport-Physics/TermRoost"
 assets = [
     { source = "target/release/packaging-root/usr/bin/terminalrooster", dest = "/usr/bin/terminalrooster", mode = "755" },
+    { source = "target/release/packaging-root/usr/lib/terminalrooster/terminalrooster-remote-linux-x86_64", dest = "/usr/lib/terminalrooster/terminalrooster-remote-linux-x86_64", mode = "755" },
     { source = "target/release/packaging-root/usr/share/applications/io.github.Davenport_Physics.TerminalRooster.desktop", dest = "/usr/share/applications/io.github.Davenport_Physics.TerminalRooster.desktop", mode = "644" },
     { source = "target/release/packaging-root/usr/share/metainfo/io.github.Davenport_Physics.TerminalRooster.metainfo.xml", dest = "/usr/share/metainfo/io.github.Davenport_Physics.TerminalRooster.metainfo.xml", mode = "644" },
     { source = "target/release/packaging-root/usr/share/icons/hicolor/16x16/apps/io.github.Davenport_Physics.TerminalRooster.png", dest = "/usr/share/icons/hicolor/16x16/apps/io.github.Davenport_Physics.TerminalRooster.png", mode = "644" },

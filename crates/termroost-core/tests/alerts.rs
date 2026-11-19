@@ -126,7 +126,8 @@ fn check(shell: Shell) {
     let dir = tempfile::tempdir().unwrap();
     let mut core = open(dir.path());
     core.dispatch(Command::SetDefaultShell(Some(shell.command.clone()))).unwrap();
-    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None }).unwrap();
+    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None, host: None })
+        .unwrap();
     let pane = core.state().active_tab().unwrap().layout.first_pane();
     wait_for_text(&mut core, pane, shell.prompt);
     let h = core.terminal(pane).unwrap();
@@ -177,7 +178,8 @@ fn running_programs_are_listed() {
         ("bash --norc --noprofile", "$", "sleep 30", "sleep")
     };
     core.dispatch(Command::SetDefaultShell(Some(shell.into()))).unwrap();
-    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None }).unwrap();
+    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None, host: None })
+        .unwrap();
     let pane = core.state().active_tab().unwrap().layout.first_pane();
     wait_for_text(&mut core, pane, prompt);
     assert_eq!(core.running_programs(), vec![], "an idle shell runs nothing");
@@ -237,7 +239,8 @@ fn git_bash_says_what_runs() {
     })
     .unwrap();
     core.dispatch(Command::SetDefaultShell(Some(format!("\"{exe}\" -i -l")))).unwrap();
-    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None }).unwrap();
+    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None, host: None })
+        .unwrap();
     let pane = core.state().active_tab().unwrap().layout.first_pane();
     wait_for_text(&mut core, pane, "$");
     core.terminal(pane).unwrap().write("sleep 3\r");
@@ -256,7 +259,8 @@ fn activity_is_reported() {
     let dir = tempfile::tempdir().unwrap();
     let mut core = open(dir.path());
     core.dispatch(Command::SetDefaultShell(Some(shell.command.clone()))).unwrap();
-    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None }).unwrap();
+    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None, host: None })
+        .unwrap();
     let pane = core.state().active_tab().unwrap().layout.first_pane();
     wait_for_text(&mut core, pane, shell.prompt);
     let h = core.terminal(pane).unwrap();

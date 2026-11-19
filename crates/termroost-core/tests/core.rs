@@ -78,7 +78,8 @@ fn terminal_runs_and_reports_exit() {
     let dir = tempfile::tempdir().unwrap();
     let mut core = open(dir.path());
     core.dispatch(Command::SetDefaultShell(Some(printer("hello terminalrooster", Some(3))))).unwrap();
-    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None }).unwrap();
+    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None, host: None })
+        .unwrap();
     let pane = only_pane(&core);
 
     let mut code = None;
@@ -109,7 +110,12 @@ fn state_and_scrollback_survive_restart() {
         let mut core = open(dir.path());
         core.dispatch(Command::SetDefaultShell(Some(printer("marker-123", None)))).unwrap();
         let Outcome::Project(project) = core
-            .dispatch(Command::CreateProject { name: "api".into(), working_dir: dir.path().into(), shell: None })
+            .dispatch(Command::CreateProject {
+                name: "api".into(),
+                working_dir: dir.path().into(),
+                shell: None,
+                host: None,
+            })
             .unwrap()
         else {
             panic!()
@@ -173,8 +179,13 @@ fn agents_resume_their_exact_session() {
         let mut core = open(dir.path());
         // `cat` echoes what is typed, so the launch line shows without running an agent.
         core.dispatch(Command::SetDefaultShell(Some(printer("ready", None)))).unwrap();
-        core.dispatch(Command::CreateProject { name: "a".into(), working_dir: dir.path().into(), shell: None })
-            .unwrap();
+        core.dispatch(Command::CreateProject {
+            name: "a".into(),
+            working_dir: dir.path().into(),
+            shell: None,
+            host: None,
+        })
+        .unwrap();
         pane = only_pane(&core);
         wait_for_text(&mut core, pane, "ready");
         core.dispatch(Command::StartAgent { pane, kind: AgentKind::Claude, args: "--model opus".into() }).unwrap();
@@ -216,7 +227,7 @@ fn delete_semantics() {
     let mut core = open(dir.path());
     core.dispatch(Command::SetDefaultShell(Some(printer("x", None)))).unwrap();
     let Outcome::Project(p) = core
-        .dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None })
+        .dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None, host: None })
         .unwrap()
     else {
         panic!()
@@ -301,7 +312,7 @@ fn reordering_survives_restart() {
     let mut core = open(dir.path());
     core.dispatch(Command::SetDefaultShell(Some(printer("x", None)))).unwrap();
     let mut project = |name: &str| match core
-        .dispatch(Command::CreateProject { name: name.into(), working_dir: dir.path().into(), shell: None })
+        .dispatch(Command::CreateProject { name: name.into(), working_dir: dir.path().into(), shell: None, host: None })
         .unwrap()
     {
         Outcome::Project(p) => p,
@@ -345,7 +356,7 @@ fn groups_keep_their_projects_together() {
     let mut core = open(dir.path());
     core.dispatch(Command::SetDefaultShell(Some(printer("x", None)))).unwrap();
     let mut project = |name: &str| match core
-        .dispatch(Command::CreateProject { name: name.into(), working_dir: dir.path().into(), shell: None })
+        .dispatch(Command::CreateProject { name: name.into(), working_dir: dir.path().into(), shell: None, host: None })
         .unwrap()
     {
         Outcome::Project(p) => p,
@@ -417,7 +428,7 @@ fn crash_child(dir: &Path) -> ! {
     let mut core = open(dir);
     core.dispatch(Command::SetDefaultShell(Some(printer("crash-marker", None)))).unwrap();
     let Outcome::Project(p) = core
-        .dispatch(Command::CreateProject { name: "survivor".into(), working_dir: dir.into(), shell: None })
+        .dispatch(Command::CreateProject { name: "survivor".into(), working_dir: dir.into(), shell: None, host: None })
         .unwrap()
     else {
         panic!()
@@ -473,7 +484,7 @@ fn closed_terminals_end_their_shells() {
     let mut core = open(dir.path());
     core.dispatch(Command::SetDefaultShell(Some(printer("x", None)))).unwrap();
     let Outcome::Project(p) = core
-        .dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None })
+        .dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None, host: None })
         .unwrap()
     else {
         panic!()
@@ -504,7 +515,8 @@ fn palette_can_change_at_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let mut core = open(dir.path());
     core.dispatch(Command::SetDefaultShell(Some(printer("colors", None)))).unwrap();
-    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None }).unwrap();
+    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None, host: None })
+        .unwrap();
     let pane = only_pane(&core);
     wait_for_text(&mut core, pane, "colors");
     let handle = core.terminal(pane).unwrap();
@@ -575,8 +587,13 @@ fn agents_started_by_hand_are_detected_and_resumed_exactly() {
     {
         let mut core = open_with_homes();
         core.dispatch(Command::SetDefaultShell(Some("sh".into()))).unwrap();
-        core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None })
-            .unwrap();
+        core.dispatch(Command::CreateProject {
+            name: "p".into(),
+            working_dir: dir.path().into(),
+            shell: None,
+            host: None,
+        })
+        .unwrap();
         pane = only_pane(&core);
         let term = core.terminal(pane).unwrap();
         std::thread::sleep(Duration::from_millis(500));
@@ -633,7 +650,8 @@ fn codex_hook_reports_pin_threads_to_the_right_terminal() {
     let command = hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap().to_owned();
 
     core.dispatch(Command::SetDefaultShell(Some("sh".into()))).unwrap();
-    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None }).unwrap();
+    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None, host: None })
+        .unwrap();
     let one = only_pane(&core);
     let Outcome::Pane(two) = core.dispatch(Command::SplitPane { pane: one, axis: Axis::Vertical }).unwrap() else {
         panic!()
@@ -698,7 +716,8 @@ fn windows_shell_paths_and_arguments_keep_their_spaces() {
     let dir = tempfile::tempdir().unwrap();
     let mut core = open(dir.path());
     core.dispatch(Command::SetDefaultShell(Some(command))).unwrap();
-    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None }).unwrap();
+    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None, host: None })
+        .unwrap();
     let pane = only_pane(&core);
     wait_for_text(&mut core, pane, "spaced args-ok");
 }
@@ -723,7 +742,13 @@ fn relocating_a_session_moves_idle_shells_only() {
     };
     let mut core = open(dir.path());
     core.dispatch(Command::SetDefaultShell(Some(shell.into()))).unwrap();
-    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: project_dir.clone(), shell: None }).unwrap();
+    core.dispatch(Command::CreateProject {
+        name: "p".into(),
+        working_dir: project_dir.clone(),
+        shell: None,
+        host: None,
+    })
+    .unwrap();
     let tab = core.state().active_tab().unwrap().id;
     let idle = only_pane(&core);
     let Outcome::Pane(busy) = core.dispatch(Command::SplitPane { pane: idle, axis: Axis::Vertical }).unwrap() else {
@@ -765,8 +790,13 @@ fn restored_terminals_start_where_their_shell_was() {
     let pane = {
         let mut core = open(dir.path());
         core.dispatch(Command::SetDefaultShell(Some(shell.into()))).unwrap();
-        core.dispatch(Command::CreateProject { name: "p".into(), working_dir: project_dir.clone(), shell: None })
-            .unwrap();
+        core.dispatch(Command::CreateProject {
+            name: "p".into(),
+            working_dir: project_dir.clone(),
+            shell: None,
+            host: None,
+        })
+        .unwrap();
         let pane = only_pane(&core);
         // What the shell integration sends after a `cd`.
         core.apply_event(&Event::CwdChanged { pane, dir: inner.clone() });
@@ -814,7 +844,8 @@ fn restored_terminals_keep_their_own_history(
     let (a, b) = {
         let mut core = open(dir);
         core.dispatch(Command::SetDefaultShell(Some(shell.to_owned()))).unwrap();
-        core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.into(), shell: None }).unwrap();
+        core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.into(), shell: None, host: None })
+            .unwrap();
         let a = only_pane(&core);
         let Outcome::Pane(b) = core.dispatch(Command::SplitPane { pane: a, axis: Axis::Vertical }).unwrap() else {
             panic!()
@@ -909,7 +940,8 @@ fn relocating_moves_an_idle_git_bash() {
     std::fs::create_dir_all(&moved).unwrap();
     let mut core = open(dir.path());
     core.dispatch(Command::SetDefaultShell(Some(bash.command.clone()))).unwrap();
-    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None }).unwrap();
+    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None, host: None })
+        .unwrap();
     let tab = core.state().active_tab().unwrap().id;
     let pane = only_pane(&core);
     core.terminal(pane).unwrap().write("echo re\"\"ady\r");
@@ -938,7 +970,12 @@ fn new_sessions_can_start_in_another_directory() {
     let mut core = open(dir.path());
     core.dispatch(Command::SetDefaultShell(Some(shell.into()))).unwrap();
     let Outcome::Project(project) = core
-        .dispatch(Command::CreateProject { name: "p".into(), working_dir: project_dir.clone(), shell: None })
+        .dispatch(Command::CreateProject {
+            name: "p".into(),
+            working_dir: project_dir.clone(),
+            shell: None,
+            host: None,
+        })
         .unwrap()
     else {
         panic!()
@@ -979,7 +1016,12 @@ fn leaving_a_folder_frees_it_for_deletion() {
     let mut core = open(dir.path());
     core.dispatch(Command::SetDefaultShell(Some(shell.into()))).unwrap();
     let Outcome::Project(project) = core
-        .dispatch(Command::CreateProject { name: "p".into(), working_dir: project_dir.clone(), shell: None })
+        .dispatch(Command::CreateProject {
+            name: "p".into(),
+            working_dir: project_dir.clone(),
+            shell: None,
+            host: None,
+        })
         .unwrap()
     else {
         panic!()
@@ -1005,7 +1047,7 @@ fn leaving_a_folder_frees_it_for_deletion() {
     }
     std::thread::sleep(Duration::from_millis(500));
 
-    let left = core.leave_dir(&worktree);
+    let left = core.leave_dir(None, &worktree);
     assert_eq!(left.closed, vec![in_worktree, in_sub]);
     assert_eq!(left.busy, vec![busy]);
     assert!(!left.pids.is_empty());

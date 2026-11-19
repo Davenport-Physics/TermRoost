@@ -1,5 +1,6 @@
-//! Folder paths as typed and shown: `~` for the home folder, and Tab
-//! completion of folder names.
+//! Folder paths as typed and shown: `~` for the home folder, Tab
+//! completion of folder names, and folders of SSH hosts as scp takes them
+//! (`droplet:~/app`).
 
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 
@@ -33,6 +34,36 @@ pub fn pretty(path: &Path, home: Option<&Path>) -> String {
     path.display().to_string()
 }
 
+/// A folder of an SSH host, typed as scp takes it: `host:path`, the path
+/// relative to the home folder there unless it starts with `/` (an empty one
+/// is the home folder). `None` for a folder of this computer, such as
+/// `C:\src` on Windows.
+pub fn split_remote(input: &str) -> Option<(String, String)> {
+    let (host, path) = input.trim().split_once(':')?;
+    let drive = cfg!(windows) && host.len() == 1;
+    let plain = !host.is_empty() && !host.contains(is_sep) && !host.contains('\\') && !host.starts_with('-');
+    (plain && !drive && !host.contains(char::is_whitespace)).then(|| {
+        let path = if path.is_empty() { "~".to_owned() } else { path.to_owned() };
+        (host.to_owned(), path)
+    })
+}
+
+/// `input` (`head` then a partial name) completed with what `names` (the
+/// folders there that start with it) share, or `None` when that adds
+/// nothing. A unique match gets a `/`.
+pub fn complete_from(input: &str, mut names: Vec<String>) -> Option<String> {
+    let cut = input.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let head = &input[..cut];
+    names.sort();
+    let first = names.first()?;
+    let common = names.iter().skip(1).fold(first.chars().count(), |n, other| {
+        first.chars().zip(other.chars()).take(n).take_while(|(a, b)| a == b).count()
+    });
+    let stem: String = first.chars().take(common).collect();
+    let done = if names.len() == 1 { format!("{head}{stem}/") } else { format!("{head}{stem}") };
+    (done != input).then_some(done)
+}
+
 /// `input` with its last folder name completed as far as the folders there
 /// agree, or `None` when that adds nothing. A unique match gets a separator.
 pub fn complete(input: &str, base: &Path, home: Option<&Path>) -> Option<String> {
@@ -62,6 +93,27 @@ pub fn complete(input: &str, base: &Path, home: Option<&Path>) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_folders_are_typed_as_for_scp() {
+        assert_eq!(split_remote("droplet:/srv/app"), Some(("droplet".into(), "/srv/app".into())));
+        assert_eq!(split_remote("me@10.0.0.2:app"), Some(("me@10.0.0.2".into(), "app".into())));
+        assert_eq!(split_remote("droplet:"), Some(("droplet".into(), "~".into())));
+        assert_eq!(split_remote("/srv/app"), None);
+        assert_eq!(split_remote("./a:b"), None);
+        assert_eq!(split_remote(":x"), None);
+        #[cfg(windows)]
+        assert_eq!(split_remote(r"C:\src"), None);
+    }
+
+    #[test]
+    fn remote_names_complete_as_far_as_they_agree() {
+        let found = ["/srv/apple".to_owned(), "/srv/apps".to_owned()];
+        let names = found.iter().map(|f| f.trim_end_matches('/').rsplit('/').next().unwrap().to_owned()).collect();
+        assert_eq!(complete_from("/srv/a", names), Some("/srv/app".into()));
+        assert_eq!(complete_from("/srv/a", vec!["apple".into()]), Some("/srv/apple/".into()));
+        assert_eq!(complete_from("/srv/x", Vec::new()), None);
+    }
 
     fn tree() -> (PathBuf, impl Drop) {
         struct Gone(PathBuf);

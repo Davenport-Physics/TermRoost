@@ -212,7 +212,10 @@ impl App {
         let s = self.core.state();
         let Some(tab) = s.active_tab() else { return Task::none() };
         let from = s.tab_working_dir(tab);
-        let Some(status) = git::Status::of(&from) else {
+        // A remote host's as its last read saw it: asking it here would hold up the window.
+        let status =
+            if self.core.tab_machine(tab.id).is_remote() { self.git_of(tab).cloned() } else { git::Status::of(&from) };
+        let Some(status) = status else {
             self.error = Some(format!("{} is not in a git repository.", display_dir(&from)));
             return Task::none();
         };

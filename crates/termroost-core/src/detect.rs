@@ -266,7 +266,7 @@ impl Detector {
 }
 
 /// A program running in a terminal, below its shell.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Program {
     /// The process name without `.exe` (`node`), or the agent's name (`Claude Code`).
     pub name: String,

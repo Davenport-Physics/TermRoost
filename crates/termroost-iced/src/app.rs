@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use termroost_core::session::shell::{self, ShellOption};
 use termroost_core::session::{bundled_bash, bundled_nvim};
 use termroost_core::{
-    Activity, AgentKind, Axis, Command, Core, Event, GroupId, NoteId, Outcome, PaneId, ProjectId, TabId, TaskId, git,
+    Activity, AgentKind, Axis, Command, Core, Event, GroupId, NoteId, Outcome, PaneId, ProjectId, RemoteStatus, TabId,
+    TaskId, git,
 };
 
 use crate::color_picker::{ColorPicker, Hsl};
@@ -178,6 +179,10 @@ pub enum Dialog {
         name: String,
         dir: String,
         shell: String,
+        /// The SSH host the project is on; empty: this computer.
+        host: String,
+        /// The host is being asked whether the folder is there.
+        checking: bool,
         error: Option<String>,
     },
     ConfirmDeleteProject(ProjectId),
@@ -371,6 +376,9 @@ pub enum Message {
     DialogName(String),
     DialogDir(String),
     DialogShell(String),
+    DialogHost(String),
+    /// The project dialog's host said where its folder is, or why not.
+    ProjectChecked(Result<PathBuf, String>),
     DialogResume(String),
     DialogArgs(String),
     DialogKeepRunning(bool),
@@ -447,9 +455,9 @@ pub enum Message {
     GitStatus {
         /// Where each session directory of the selected project stands in
         /// git (`None`: not in a repository).
-        statuses: Vec<(PathBuf, Option<git::Status>)>,
+        statuses: Vec<(Place, Option<git::Status>)>,
         /// The directories of all sessions that no longer exist.
-        gone: Vec<PathBuf>,
+        gone: Vec<Place>,
     },
     Worktree(WorktreeMsg),
     RemoveWorktree(RemoveMsg),
@@ -504,11 +512,11 @@ pub struct App {
     /// Information worth a banner that is not an error.
     pub(crate) notice: Option<String>,
     /// Git status of session directories, read in the background.
-    pub(crate) git: HashMap<PathBuf, Option<git::Status>>,
+    pub(crate) git: HashMap<Place, Option<git::Status>>,
     /// A periodic git read is running.
     git_polling: bool,
     /// Session folders deleted outside the app (see `gone_folders`).
-    pub(crate) gone: HashSet<PathBuf>,
+    pub(crate) gone: HashSet<Place>,
     /// The log in the side panel's Git tab.
     pub(crate) git_log: Option<GitLog>,
     /// The Git tab's last pull, push or change of remote.
@@ -520,6 +528,9 @@ pub struct App {
     pub(crate) settings: Option<SettingsState>,
     /// Shells installed on this machine, for the shell pickers.
     pub(crate) shells: Vec<ShellOption>,
+    /// SSH hosts to offer in the project dialog: those of `~/.ssh/config`
+    /// and of the projects.
+    pub(crate) ssh_hosts: Vec<String>,
     pub(crate) bash_install: InstallState,
     pub(crate) nvim_install: InstallState,
     pub(crate) system_mode: iced::theme::Mode,
@@ -629,6 +640,7 @@ impl App {
             themes_dirty: false,
             settings: None,
             shells: Vec::new(),
+            ssh_hosts: Vec::new(),
             bash_install: InstallState::Idle,
             nvim_install: InstallState::Idle,
             system_mode: iced::theme::Mode::None,
@@ -831,34 +843,52 @@ impl App {
 
     /// Git status of a tab's working directory, from the last background read.
     pub(crate) fn git_of(&self, tab: &termroost_core::Tab) -> Option<&git::Status> {
-        self.git.get(&self.core.state().tab_working_dir(tab))?.as_ref()
+        self.git.get(&self.tab_place(tab))?.as_ref()
+    }
+
+    /// A tab's working directory, with the host it is on.
+    pub(crate) fn tab_place(&self, tab: &termroost_core::Tab) -> Place {
+        let s = self.core.state();
+        (s.project(tab.project).and_then(|p| p.host.clone()), s.tab_working_dir(tab))
     }
 
     /// Reads the git status of the selected project's sessions on a thread
-    /// (directories may be on a slow network drive), and looks whether the
-    /// folders of all sessions still exist.
+    /// (directories may be on a slow network drive, or another computer), and
+    /// looks whether the folders of all sessions still exist. A remote
+    /// host is only asked while connected: what it said last stays.
     pub(crate) fn read_git(&self) -> Task<Message> {
         let s = self.core.state();
-        let sorted = |mut dirs: Vec<PathBuf>| {
+        let sorted = |mut dirs: Vec<Place>| {
             dirs.sort();
             dirs.dedup();
             dirs
         };
+        let connected =
+            |place: &Place| place.0.as_deref().is_none_or(|h| self.core.remote_status(h) == RemoteStatus::Connected);
         let dirs = sorted(match s.selected_project {
-            Some(project) => s.tabs_of(project).map(|t| s.tab_working_dir(t)).collect(),
+            Some(project) => s.tabs_of(project).map(|t| self.tab_place(t)).filter(connected).collect(),
             None => Vec::new(),
         });
-        let all = sorted(s.tabs.iter().map(|t| s.tab_working_dir(t)).collect());
+        let all = sorted(s.tabs.iter().map(|t| self.tab_place(t)).collect());
+        let machines: HashMap<Option<String>, termroost_core::Machine> =
+            all.iter().map(|(host, _)| (host.clone(), self.core.machine(host.as_deref()))).collect();
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let statuses = dirs
                 .into_iter()
-                .map(|d| {
-                    let status = git::Status::of(&d);
-                    (d, status)
+                .map(|place| {
+                    let status = machines.get(&place.0).and_then(|m| m.git_status(&place.1));
+                    (place, status)
                 })
                 .collect();
-            let gone = all.into_iter().filter(|d| !d.is_dir()).collect();
+            // Each computer's at once; one that can't be asked now has none gone.
+            let mut gone = Vec::new();
+            for (host, machine) in &machines {
+                let dirs: Vec<PathBuf> = all.iter().filter(|(h, _)| h == host).map(|(_, d)| d.clone()).collect();
+                if let Some(are) = machine.are_dirs(&dirs) {
+                    gone.extend(dirs.into_iter().zip(are).filter(|(_, is)| !is).map(|(d, _)| (host.clone(), d)));
+                }
+            }
             let _ = tx.send_blocking((statuses, gone));
         });
         Task::perform(async move { rx.recv().await.unwrap_or_default() }, |(statuses, gone)| Message::GitStatus {
@@ -957,7 +987,7 @@ impl App {
             Message::Core(_)
             | Message::Tick
             | Message::Key(_)
-            | Message::Files(FilesMsg::Listed(_) | FilesMsg::Changed(_) | FilesMsg::NewFileName(_)) => true,
+            | Message::Files(FilesMsg::Listed { .. } | FilesMsg::Changed(_) | FilesMsg::NewFileName(_)) => true,
             Message::Editor(msg) => !msg.loggable(),
             Message::Notes(msg) => !msg.loggable(),
             Message::GitView(msg) => !msg.loggable(),
@@ -989,6 +1019,18 @@ impl App {
                         };
                     }
                     Event::ClipboardStore(text) => return iced::clipboard::write(text),
+                    Event::Remote { host, status } => {
+                        let copying = format!("Copying Terminal Rooster's helper to {host}…");
+                        match status {
+                            RemoteStatus::Copying => self.notice = Some(copying),
+                            _ if self.notice.as_ref() == Some(&copying) => self.notice = None,
+                            _ => {}
+                        }
+                        if status == RemoteStatus::Connected {
+                            // What the host's sessions stand at in git, now that it can be asked.
+                            return self.read_git();
+                        }
+                    }
                     Event::Alert { pane, alert } => return self.on_notice(pane, Notice::from_alert(&alert)),
                     Event::ProcessExited { pane, code: Some(code) } if code != 0 => {
                         return self.on_notice(pane, Notice::shell_exited(code));
@@ -1072,7 +1114,9 @@ impl App {
                     // Terminals under helpers go on running.
                     let s = self.core.state();
                     let stops = |t: &RunningTerminal| {
-                        self.core.host_command().is_none() || !s.pane(t.pane).is_some_and(|p| p.keep_running)
+                        let remote = self.core.terminal(t.pane).is_some_and(|h| h.remote().is_some());
+                        (self.core.host_command().is_none() && !remote)
+                            || !s.pane(t.pane).is_some_and(|p| p.keep_running)
                     };
                     self.running_terminals().into_iter().filter(stops).chain(self.running_editors()).collect()
                 } else {
@@ -1218,11 +1262,14 @@ impl App {
             }
 
             Message::NewProject => {
+                self.ssh_hosts = self.known_ssh_hosts();
                 self.dialog = Some(Dialog::Project {
                     editing: None,
                     name: String::new(),
                     dir: String::new(),
                     shell: String::new(),
+                    host: String::new(),
+                    checking: false,
                     error: None,
                 });
                 return operation::focus(DIALOG_FIRST_INPUT);
@@ -1234,6 +1281,8 @@ impl App {
                         name: p.name.clone(),
                         dir: p.working_dir.display().to_string(),
                         shell: p.shell.clone().unwrap_or_default(),
+                        host: p.host.clone().unwrap_or_default(),
+                        checking: false,
                         error: None,
                     });
                     return operation::focus(DIALOG_FIRST_INPUT);
@@ -1267,6 +1316,7 @@ impl App {
                 let cwd = s
                     .selected_project
                     .and_then(|p| s.project(p))
+                    .filter(|p| p.host.is_none())
                     .map(|p| p.working_dir.clone())
                     .filter(|d| d.is_dir())
                     .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()))
@@ -1532,6 +1582,28 @@ impl App {
                     *shell = v;
                 }
             }
+            Message::DialogHost(v) => {
+                if let Some(Dialog::Project { host, editing: None, error, .. }) = &mut self.dialog {
+                    *host = v;
+                    *error = None;
+                }
+            }
+            Message::ProjectChecked(result) => {
+                // Unless the dialog was closed meanwhile.
+                if let Some(Dialog::Project { checking, error, .. }) = &mut self.dialog
+                    && std::mem::take(checking)
+                {
+                    match result {
+                        Ok(path) => {
+                            let Some(Dialog::Project { editing, name, shell, host, .. }) = self.dialog.take() else {
+                                return Task::none();
+                            };
+                            return self.save_project(editing, name, path, shell, Some(host));
+                        }
+                        Err(e) => *error = Some(e),
+                    }
+                }
+            }
             Message::DialogResume(v) => {
                 if let Some(Dialog::Pane { resume, .. }) = &mut self.dialog {
                     *resume = v;
@@ -1564,6 +1636,9 @@ impl App {
                 );
             }
             Message::DirPicked(path) => {
+                if matches!(&self.dialog, Some(Dialog::Project { host, .. }) if !host.trim().is_empty()) {
+                    return Task::none();
+                }
                 if let (Some(path), Some(Dialog::Project { dir, name, .. })) = (path, &mut self.dialog) {
                     *dir = path.display().to_string();
                     fill_name_from_dir(name, dir);
@@ -1873,36 +1948,87 @@ impl App {
         Task::none()
     }
 
+    /// Creates the project of the project dialog, or saves the one edited.
+    /// `host`: the SSH host it is on (empty or `None`: this computer).
+    fn save_project(
+        &mut self,
+        editing: Option<ProjectId>,
+        name: String,
+        path: PathBuf,
+        shell: String,
+        host: Option<String>,
+    ) -> Task<Message> {
+        let shell = Some(shell).filter(|s| !s.trim().is_empty());
+        let host = host.filter(|h| !h.trim().is_empty());
+        match editing {
+            None => {
+                self.dispatch(Command::CreateProject { name, working_dir: path, shell, host });
+                self.after_select()
+            }
+            Some(project) => {
+                self.dispatch(Command::RenameProject { project, name });
+                self.dispatch(Command::SetProjectDir { project, working_dir: path });
+                self.dispatch(Command::SetProjectShell { project, shell });
+                Task::none()
+            }
+        }
+    }
+
+    /// The hosts of `~/.ssh/config`, then those of projects that aren't there.
+    fn known_ssh_hosts(&self) -> Vec<String> {
+        let mut hosts = termroost_core::remote::ssh_config_hosts();
+        for p in &self.core.state().projects {
+            if let Some(h) = &p.host
+                && !hosts.contains(h)
+            {
+                hosts.push(h.clone());
+            }
+        }
+        hosts
+    }
+
     fn submit_dialog(&mut self) -> Task<Message> {
         let Some(dialog) = self.dialog.take() else { return Task::none() };
         match dialog {
-            Dialog::Project { editing, name, dir, shell, .. } => {
+            Dialog::Project { editing, name, dir, shell, host, checking, .. } => {
+                let host = host.trim().to_owned();
+                if checking {
+                    self.dialog = Some(Dialog::Project { editing, name, dir, shell, host, checking, error: None });
+                    return Task::none();
+                }
                 let path = expand_home(dir.trim());
                 let problem = if name.trim().is_empty() {
-                    Some("Give the project a name.")
-                } else if dir.trim().is_empty() {
-                    Some("Choose a working directory.")
-                } else if !path.is_dir() {
-                    Some("That directory does not exist.")
+                    Some("Give the project a name.".to_owned())
+                } else if dir.trim().is_empty() && host.is_empty() {
+                    Some("Choose a working directory.".to_owned())
+                } else if let Err(e) = (!host.is_empty()).then(|| termroost_core::remote::check_host(&host)).transpose()
+                {
+                    Some(e)
+                } else if host.is_empty() && !path.is_dir() {
+                    Some("That directory does not exist.".to_owned())
                 } else {
                     None
                 };
                 if let Some(problem) = problem {
-                    self.dialog = Some(Dialog::Project { editing, name, dir, shell, error: Some(problem.into()) });
+                    self.dialog =
+                        Some(Dialog::Project { editing, name, dir, shell, host, checking, error: Some(problem) });
                     return Task::none();
                 }
-                let shell = Some(shell).filter(|s| !s.trim().is_empty());
-                match editing {
-                    None => {
-                        self.dispatch(Command::CreateProject { name, working_dir: path, shell });
-                        return self.after_select();
-                    }
-                    Some(project) => {
-                        self.dispatch(Command::RenameProject { project, name });
-                        self.dispatch(Command::SetProjectDir { project, working_dir: path });
-                        self.dispatch(Command::SetProjectShell { project, shell });
-                    }
+                if host.is_empty() {
+                    return self.save_project(editing, name, path, shell, None);
                 }
+                // The host says whether the folder is there (`~` is its home there).
+                let machine = self.core.machine(Some(&host));
+                let asked = PathBuf::from(dir.trim());
+                self.dialog = Some(Dialog::Project { editing, name, dir, shell, host, checking: true, error: None });
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let _ = tx.send_blocking(machine.resolve_dir(&asked));
+                });
+                return Task::perform(
+                    async move { rx.recv().await.unwrap_or_else(|_| Err("checking stopped".into())) },
+                    Message::ProjectChecked,
+                );
             }
             Dialog::ConfirmDeleteProject(project) => {
                 let tabs: Vec<TabId> = self.core.state().tabs_of(project).map(|t| t.id).collect();
@@ -2392,6 +2518,10 @@ pub(crate) fn expand_home(p: &str) -> PathBuf {
     }
     PathBuf::from(p)
 }
+
+/// A folder, with the SSH host it is on (`None`: this computer): the same
+/// path is a different folder on another computer.
+pub(crate) type Place = (Option<String>, PathBuf);
 
 /// Suggests the folder name as project name while the name is still empty.
 fn fill_name_from_dir(name: &mut String, dir: &str) {

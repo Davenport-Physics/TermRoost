@@ -4179,8 +4179,10 @@ version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "async-channel",
+ "base64 0.22.1",
  "chrono",
  "directories",
+ "ignore",
  "polling",
  "rusqlite",
  "serde",
@@ -4219,6 +4221,15 @@ dependencies = [
  "ttf-parser",
  "windows-registry",
  "winresource",
+]
+
+[[package]]
+name = "termroost-remote"
+version = "0.2.0"
+dependencies = [
+ "termroost-core",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

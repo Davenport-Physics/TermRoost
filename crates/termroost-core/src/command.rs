@@ -18,6 +18,9 @@ pub enum Command {
         name: String,
         working_dir: PathBuf,
         shell: Option<String>,
+        /// The SSH host its folder is on (see [`crate::Project::host`]).
+        #[serde(default)]
+        host: Option<String>,
     },
     RenameProject {
         project: ProjectId,
@@ -253,4 +256,9 @@ pub enum Event {
     /// shown elsewhere (a console window of its own); its program runs on.
     /// [`crate::Core::bring_back`] shows it here again.
     ShownElsewhere(PaneId),
+    /// The connection to a remote host changed (see [`crate::RemoteHost::status`]).
+    Remote {
+        host: String,
+        status: crate::remote::RemoteStatus,
+    },
 }

@@ -136,8 +136,28 @@ impl App {
             std::iter::once(sh.program).chain(sh.args).collect::<Vec<_>>().join(" ")
         };
         let parts: DialogParts<'_> = match dialog {
-            Dialog::Project { editing, name, dir, shell, error } => {
-                let default_shell = s.settings.default_shell.clone().unwrap_or_else(|| platform_shell.clone());
+            Dialog::Project { editing, name, dir, shell, host, checking, error } => {
+                let remote = !host.trim().is_empty();
+                let default_shell = if remote {
+                    "the login shell there".to_owned()
+                } else {
+                    s.settings.default_shell.clone().unwrap_or_else(|| platform_shell.clone())
+                };
+                // A project stays on the computer it was made on.
+                let host_input = ui::input("This computer", host).on_submit(Message::DialogSubmit);
+                let host_input = if editing.is_none() { host_input.on_input(Message::DialogHost) } else { host_input };
+                let hosts = (editing.is_none() && !self.ssh_hosts.is_empty()).then(|| {
+                    let picked = self.ssh_hosts.iter().find(|h| h.as_str() == host.trim()).cloned();
+                    iced::widget::pick_list(self.ssh_hosts.as_slice(), picked, Message::DialogHost)
+                        .placeholder("SSH hosts…")
+                        .text_size(TEXT)
+                        .padding([6, 10])
+                        .width(160)
+                        .style(theme::dropdown)
+                        .menu_style(theme::dropdown_menu)
+                });
+                let browse = ui::secondary("Browse…");
+                let browse = if remote { browse } else { browse.on_press(Message::BrowseDir) };
                 let mut col = column![
                     field(
                         "Name",
@@ -146,13 +166,23 @@ impl App {
                             .on_input(Message::DialogName)
                             .on_submit(Message::DialogSubmit),
                     ),
+                    column![
+                        field("Computer", row![host_input].push(hosts).spacing(8).align_y(Alignment::Center)),
+                        muted_text(if editing.is_some() {
+                            "A project stays on the computer it was made on."
+                        } else {
+                            "Empty for this computer, or an SSH host as ssh takes it (droplet, me@203.0.113.7): \
+                             the project's terminals, files and git are there."
+                        }),
+                    ]
+                    .spacing(6),
                     field(
                         "Working directory",
                         row![
-                            ui::input("/path/to/project", dir)
+                            ui::input(if remote { "~/project, or /srv/project" } else { "/path/to/project" }, dir)
                                 .on_input(Message::DialogDir)
                                 .on_submit(Message::DialogSubmit),
-                            ui::secondary("Browse…").on_press(Message::BrowseDir),
+                            browse,
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center),
@@ -163,19 +193,34 @@ impl App {
                             ui::input(&format!("default: {default_shell}"), shell)
                                 .on_input(Message::DialogShell)
                                 .on_submit(Message::DialogSubmit),
-                            // Empty means "the default", so nothing is shown as picked.
-                            self.shell_picker(shell, "", |o| Message::DialogShell(o.command)),
                         ]
+                        // Empty means "the default", so nothing is shown as picked.
+                        // This computer's shells are no use on another.
+                        .push(
+                            (!remote)
+                                .then(|| self.shell_picker(shell, "", |o| Message::DialogShell(o.command)))
+                                .flatten()
+                        )
                         .spacing(8)
                         .align_y(Alignment::Center),
                     ),
                 ]
                 .spacing(16);
+                if *checking {
+                    col = col.push(muted_text(format!("Connecting to {}…", host.trim())));
+                }
                 if let Some(e) = error {
                     col = col.push(ui::note_text(Tone::Danger, e));
                 }
                 let title = if editing.is_some() { "Edit project" } else { "New project" };
-                DialogParts::new(title, col).confirm(if editing.is_some() { "Save" } else { "Create" }, false)
+                let confirm = if editing.is_some() { "Save" } else { "Create" };
+                if *checking {
+                    DialogParts::new(title, col)
+                        .button(ui::secondary("Cancel").on_press(Message::DialogCancel))
+                        .button(ui::primary(confirm))
+                } else {
+                    DialogParts::new(title, col).confirm(confirm, false)
+                }
             }
             Dialog::ConfirmDeleteProject(p) => {
                 let name = s.project(*p).map(|p| p.name.as_str()).unwrap_or("project");

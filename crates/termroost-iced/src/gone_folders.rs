@@ -5,13 +5,12 @@
 //! never reported here.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 use iced::Element;
 use iced::widget::tooltip;
 use termroost_core::Tab;
 
-use crate::app::{App, Message};
+use crate::app::{App, Message, Place};
 use crate::sidebar::display_dir;
 use crate::theme::Tone;
 use crate::ui::{self, tip};
@@ -28,26 +27,26 @@ struct Gone {
 impl App {
     /// Takes the session folders the last read found missing; the ones newly
     /// missing get a banner.
-    pub(crate) fn folders_gone(&mut self, found: Vec<PathBuf>) {
+    pub(crate) fn folders_gone(&mut self, found: Vec<Place>) {
         let s = self.core.state();
-        let places: Vec<(PathBuf, &Tab)> = s.tabs.iter().map(|t| (s.tab_working_dir(t), t)).collect();
-        let sessions_in = |dir: &PathBuf| places.iter().filter(|(d, _)| d == dir).map(|(_, t)| *t).collect::<Vec<_>>();
+        let places: Vec<(Place, &Tab)> = s.tabs.iter().map(|t| (self.tab_place(t), t)).collect();
+        let sessions_in = |dir: &Place| places.iter().filter(|(d, _)| d == dir).map(|(_, t)| *t).collect::<Vec<_>>();
         // Only folders sessions still work in: one closed meanwhile (such as
         // by removing its worktree in the app) doesn't count.
-        let found: HashSet<PathBuf> = found.into_iter().filter(|d| places.iter().any(|(p, _)| p == d)).collect();
-        let mut new: Vec<&PathBuf> = found.iter().filter(|d| !self.gone.contains(*d)).collect();
+        let found: HashSet<Place> = found.into_iter().filter(|d| places.iter().any(|(p, _)| p == d)).collect();
+        let mut new: Vec<&Place> = found.iter().filter(|d| !self.gone.contains(*d)).collect();
         new.sort();
         let new: Vec<Gone> = new
             .into_iter()
-            .map(|dir| Gone {
-                name: dir.file_name().map_or_else(|| display_dir(dir), |n| n.to_string_lossy().into_owned()),
+            .map(|place| Gone {
+                name: place.1.file_name().map_or_else(|| display_dir(&place.1), |n| n.to_string_lossy().into_owned()),
                 // As the last read before it went saw it.
                 worktree: self
                     .git
-                    .get(dir)
+                    .get(place)
                     .and_then(Option::as_ref)
-                    .is_some_and(|g| g.repo.is_linked() && g.repo.worktree == *dir),
-                sessions: sessions_in(dir)
+                    .is_some_and(|g| g.repo.is_linked() && g.repo.worktree == place.1),
+                sessions: sessions_in(place)
                     .into_iter()
                     .map(|t| match s.project(t.project) {
                         Some(p) if s.selected_project != Some(t.project) => format!("{} ({})", t.title, p.name),
@@ -67,8 +66,9 @@ impl App {
 
     /// A warning that `tab`'s folder was deleted, if it was.
     pub(crate) fn gone_badge(&self, tab: &Tab) -> Option<Element<'_, Message>> {
-        let dir = self.core.state().tab_working_dir(tab);
-        self.gone.contains(&dir).then(|| {
+        let place = self.tab_place(tab);
+        let dir = place.1.clone();
+        self.gone.contains(&place).then(|| {
             tip(
                 ui::badge("Folder deleted", Tone::Warning),
                 format!("{} was deleted outside {}", display_dir(&dir), crate::DISPLAY_NAME),

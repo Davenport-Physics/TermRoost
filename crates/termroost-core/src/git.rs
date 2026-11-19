@@ -16,9 +16,21 @@ use std::time::{Duration, Instant};
 
 pub use diff::{CommitDetails, DiffLine, FileDiff, FileStatus, Hunk, LineKind, Signature, WorkingChanges};
 
+use serde::{Deserialize, Serialize};
+
+use crate::remote::Machine;
+use crate::remote::wire::GitOp;
+
+/// How long git may take on a remote host: longer than a pull or push may
+/// take there (see [`REMOTE_TIMEOUT`]).
+const HOST_TIMEOUT: Duration = Duration::from_secs(6 * 60);
+
 /// The working tree a directory belongs to.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Repo {
+    /// The computer it is on: its methods run git there.
+    #[serde(skip)]
+    pub machine: Machine,
     /// Top directory of the working tree.
     pub worktree: PathBuf,
     /// The working tree's own git directory: `<worktree>/.git`, or
@@ -29,7 +41,7 @@ pub struct Repo {
 }
 
 /// What a working tree has checked out.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Head {
     Branch(String),
     /// No branch; at this commit (abbreviated).
@@ -46,7 +58,7 @@ impl std::fmt::Display for Head {
 }
 
 /// Where a directory stands in git.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     pub repo: Repo,
     /// `None` when HEAD could not be read.
@@ -68,6 +80,14 @@ impl Status {
 }
 
 impl Repo {
+    /// Runs `op` on the repository's remote host, if it is on one: `None`
+    /// on this computer. A failure to ask comes back as `failed` makes it.
+    fn on_host<T: serde::de::DeserializeOwned>(&self, op: GitOp, failed: impl FnOnce(String) -> T) -> Option<T> {
+        let host = self.machine.remote()?;
+        let request = crate::remote::wire::Request::Git { repo: self.clone(), op };
+        Some(host.call(request, HOST_TIMEOUT).unwrap_or_else(failed))
+    }
+
     /// The working tree holding `dir`, found by looking for `.git` in it and
     /// its parents. `None` outside a repository.
     pub fn discover(dir: &Path) -> Option<Repo> {
@@ -89,13 +109,16 @@ impl Repo {
                 Ok(rel) => normalize(&git_dir.join(rel.trim())),
                 Err(_) => git_dir.clone(),
             };
-            return Some(Repo { worktree: dir.to_path_buf(), git_dir, common_dir });
+            return Some(Repo { machine: Machine::Local, worktree: dir.to_path_buf(), git_dir, common_dir });
         }
         None
     }
 
     /// The checked-out branch, or the commit when detached.
     pub fn head(&self) -> Option<Head> {
+        if let Some(out) = self.on_host(GitOp::Head, |_| None) {
+            return out;
+        }
         let text = std::fs::read_to_string(self.git_dir.join("HEAD")).ok()?;
         let text = text.trim();
         if let Some(target) = text.strip_prefix("ref:") {
@@ -132,6 +155,9 @@ impl Repo {
 
     /// Branches and working trees, for planning a new worktree.
     pub fn branches(&self) -> Result<Branches, String> {
+        if let Some(out) = self.on_host(GitOp::Branches, Err) {
+            return out;
+        }
         let refs = git(&self.worktree, &["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"])?;
         let list = git(&self.worktree, &["worktree", "list", "--porcelain"])?;
         Ok(Branches::parse(&refs, &list))
@@ -140,12 +166,17 @@ impl Repo {
     /// A free path for a worktree of `branch`, side by side with this working
     /// tree (so on the same drive): `<parent>/<repository>-<branch>`, named
     /// after the main working tree's folder.
+    /// On a remote host, which isn't asked for each name typed, the path is
+    /// not checked: one that is taken fails when the worktree is made.
     pub fn suggest_worktree_path(&self, branch: &str) -> Option<PathBuf> {
         let parent = self.worktree.parent()?;
         let main = self.main_worktree().unwrap_or_else(|| self.worktree.clone());
         let name = main.file_name()?.to_string_lossy().into_owned();
         let stem = format!("{name}-{}", slug(branch));
         let mut path = parent.join(&stem);
+        if self.machine.is_remote() {
+            return Some(path);
+        }
         let mut n = 2;
         while path.exists() {
             path = parent.join(format!("{stem}-{n}"));
@@ -157,7 +188,14 @@ impl Repo {
     /// Where a session working in `dir` (inside this working tree) belongs in
     /// the working tree at `other`: the same subdirectory when it exists
     /// there, else the top.
+    /// On a remote host it is asked only while connected (this is called
+    /// on the GUI thread); otherwise the top it is.
     pub fn same_place_in(&self, dir: &Path, other: &Path) -> PathBuf {
+        if let Some(host) = self.machine.remote() {
+            let op = GitOp::SamePlaceIn { dir: dir.into(), other: other.into() };
+            let request = crate::remote::wire::Request::Git { repo: self.clone(), op };
+            return host.call_if_up(request, Duration::from_secs(10)).unwrap_or_else(|| other.to_path_buf());
+        }
         match dir.strip_prefix(&self.worktree) {
             Ok(rel) if !rel.as_os_str().is_empty() && other.join(rel).is_dir() => other.join(rel),
             _ => other.to_path_buf(),
@@ -167,6 +205,17 @@ impl Repo {
     /// Makes a working tree for `branch` at `path`, as `plan` says. `base` is
     /// where a new branch starts (`None`: this working tree's HEAD).
     pub fn add_worktree(&self, path: &Path, branch: &str, plan: &Plan, base: Option<&str>) -> Result<(), String> {
+        if let Some(out) = self.on_host(
+            GitOp::AddWorktree {
+                path: path.into(),
+                branch: branch.to_owned(),
+                plan: plan.clone(),
+                base: base.map(str::to_owned),
+            },
+            Err,
+        ) {
+            return out;
+        }
         let path = path.to_string_lossy();
         let path: &str = &path;
         let mut args: Vec<&str> = vec!["worktree", "add"];
@@ -184,10 +233,14 @@ impl Repo {
         git(&self.worktree, &args).map(drop)
     }
 
-    /// The uncommitted changes in the working tree at `path`: changed files,
-    /// and new ones git does not ignore. `git worktree remove` keeps a working
-    /// tree with any of these unless forced. (A new folder counts once.)
-    pub fn changes(path: &Path) -> Result<usize, String> {
+    /// The uncommitted changes in the working tree at `path` (this one, or
+    /// another of the repository's): changed files, and new ones git does
+    /// not ignore. `git worktree remove` keeps a working tree with any of
+    /// these unless forced. (A new folder counts once.)
+    pub fn changes(&self, path: &Path) -> Result<usize, String> {
+        if let Some(out) = self.on_host(GitOp::Changes(path.into()), Err) {
+            return out;
+        }
         Ok(git(path, &["status", "--porcelain"])?.lines().filter(|l| !l.trim().is_empty()).count())
     }
 
@@ -197,6 +250,9 @@ impl Repo {
     /// it deletes (Windows cannot delete a folder a process is working in;
     /// see [`crate::detect::processes_in`] for the others).
     pub fn remove_worktree(&self, path: &Path, force: bool) -> Result<(), String> {
+        if let Some(out) = self.on_host(GitOp::RemoveWorktree { path: path.into(), force }, Err) {
+            return out;
+        }
         let path = path.to_string_lossy();
         let mut args = vec!["worktree", "remove"];
         if force {
@@ -209,6 +265,9 @@ impl Repo {
     /// Whether git lists a working tree at `path`. git forgets a worktree it
     /// removes even when it cannot delete all of its folder.
     pub fn has_worktree(&self, path: &Path) -> Result<bool, String> {
+        if let Some(out) = self.on_host(GitOp::HasWorktree(path.into()), Err) {
+            return out;
+        }
         let list = git(&self.main_dir(), &["worktree", "list", "--porcelain"])?;
         Ok(Branches::parse("", &list).worktrees.iter().any(|w| same_path(&w.path, path)))
     }
@@ -217,6 +276,9 @@ impl Repo {
     /// could not delete all of (see [`Repo::has_worktree`]). Refuses while
     /// git still lists it.
     pub fn remove_leftover(&self, path: &Path) -> Result<(), String> {
+        if let Some(out) = self.on_host(GitOp::RemoveLeftover(path.into()), Err) {
+            return out;
+        }
         if self.has_worktree(path)? {
             return Err(format!("{} is still a worktree", path.display()));
         }
@@ -233,6 +295,9 @@ impl Repo {
     /// last fetch. `unpushed` covers the newest `limit` commits of HEAD, or
     /// of every branch when `all`.
     pub fn tracking(&self, all: bool, limit: usize) -> Result<Tracking, String> {
+        if let Some(out) = self.on_host(GitOp::Tracking { all, limit }, Err) {
+            return out;
+        }
         let remotes = self.remotes()?;
         if remotes.is_empty() {
             return Ok(Tracking::default());
@@ -271,6 +336,9 @@ impl Repo {
 
     /// The repository's remotes, in the order `git remote` lists them.
     pub fn remotes(&self) -> Result<Vec<Remote>, String> {
+        if let Some(out) = self.on_host(GitOp::Remotes, Err) {
+            return out;
+        }
         let mut remotes: Vec<Remote> = git(&self.worktree, &["remote"])?
             .lines()
             .map(str::trim)
@@ -290,6 +358,9 @@ impl Repo {
     /// to the remote [`Repo::tracking`] names, and gets it as its upstream.
     /// Returns what happened, in a sentence.
     pub fn push(&self) -> Result<String, String> {
+        if let Some(out) = self.on_host(GitOp::Push, Err) {
+            return out;
+        }
         let Some(Head::Branch(branch)) = self.head() else {
             return Err("Not on a branch: check one out to push it.".into());
         };
@@ -311,6 +382,9 @@ impl Repo {
     /// commits on top of it, or merging it when `rebase` is off. Returns what
     /// happened, in a sentence.
     pub fn pull(&self, rebase: bool) -> Result<String, String> {
+        if let Some(out) = self.on_host(GitOp::Pull { rebase }, Err) {
+            return out;
+        }
         let Some(Head::Branch(branch)) = self.head() else {
             return Err("Not on a branch: check one out to pull into it.".into());
         };
@@ -340,6 +414,9 @@ impl Repo {
     /// current; when that fails, nothing changes. Returns what happened, in
     /// a sentence.
     pub fn use_remote(&self, remote: &str) -> Result<String, String> {
+        if let Some(out) = self.on_host(GitOp::UseRemote(remote.to_owned()), Err) {
+            return out;
+        }
         let Some(Head::Branch(branch)) = self.head() else {
             return Err("Not on a branch: check one out to choose its remote.".into());
         };
@@ -363,18 +440,27 @@ impl Repo {
 
     /// Adds a remote called `name` at `url`. Nothing is fetched from it yet.
     pub fn add_remote(&self, name: &str, url: &str) -> Result<(), String> {
+        if let Some(out) = self.on_host(GitOp::AddRemote { name: name.to_owned(), url: url.to_owned() }, Err) {
+            return out;
+        }
         git(&self.worktree, &["remote", "add", "--", name, url]).map(drop)
     }
 
     /// Points the remote `name` at `url`: fetches come from there, and so do
     /// pushes unless the remote has a push URL of its own.
     pub fn set_remote_url(&self, name: &str, url: &str) -> Result<(), String> {
+        if let Some(out) = self.on_host(GitOp::SetRemoteUrl { name: name.to_owned(), url: url.to_owned() }, Err) {
+            return out;
+        }
         git(&self.worktree, &["remote", "set-url", "--", name, url]).map(drop)
     }
 
     /// The latest `limit` commits of this working tree's HEAD, or of every
     /// branch and tag when `all`, newest first.
     pub fn log(&self, all: bool, limit: usize) -> Result<Vec<Commit>, String> {
+        if let Some(out) = self.on_host(GitOp::Log { all, limit }, Err) {
+            return out;
+        }
         let max = format!("--max-count={limit}");
         // Unit and record separators keep subjects and names unambiguous.
         let format = "--format=%H%x1f%h%x1f%an%x1f%at%x1f%D%x1f%s%x1e";
@@ -409,6 +495,9 @@ impl Repo {
     /// changes. It only reads files, so it can be checked often to decide
     /// when to run `git log`.
     pub fn ref_stamp(&self) -> u64 {
+        if let Some(out) = self.on_host(GitOp::RefStamp, |_| 0) {
+            return out;
+        }
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let read = |p: &Path| std::fs::read(p).ok();
@@ -439,7 +528,7 @@ impl Repo {
 
 /// How a working tree's commits stand against its remotes, from what the
 /// last fetch (or pull, or push) saw of them.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tracking {
     /// The remote the checked-out branch pulls from and pushes to: the one
     /// it is set to track, else `origin`, else the first remote. `None` when
@@ -459,7 +548,7 @@ pub struct Tracking {
 
 /// A remote of a repository: somewhere its branches are fetched from and
 /// pushed to.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Remote {
     pub name: String,
     /// Where it is fetched from, as set; empty when it has no URL.
@@ -486,7 +575,7 @@ fn fill_remote_urls(remotes: &mut [Remote], out: &str) {
 }
 
 /// One commit, as `git log` lists it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commit {
     pub id: String,
     /// The abbreviated id.
@@ -531,7 +620,7 @@ fn parse_log(out: &str) -> Vec<Commit> {
 }
 
 /// Branches of a repository and the working trees that have them checked out.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Branches {
     pub local: Vec<String>,
     /// Remote-tracking branches, as `<remote>/<branch>`.
@@ -541,7 +630,7 @@ pub struct Branches {
 }
 
 /// A working tree of a repository, as `git worktree list` reports it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Worktree {
     pub path: PathBuf,
     /// What it has checked out; `None` for a bare repository.
@@ -558,7 +647,7 @@ impl Worktree {
 }
 
 /// How a worktree for a branch name would be made.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Plan {
     /// No such branch yet: create it.
     NewBranch,
@@ -1071,12 +1160,12 @@ mod tests {
         let repo = Repo::discover(&root).unwrap();
         let path = repo.suggest_worktree_path("fix").unwrap();
         repo.add_worktree(&path, "fix", &Plan::NewBranch, None).unwrap();
-        assert_eq!(Repo::changes(&path), Ok(0));
+        assert_eq!(repo.changes(&path), Ok(0));
 
         // Removing from the worktree's own Repo works too: git runs in the main one.
         let inside = Repo::discover(&path).unwrap();
         std::fs::write(path.join("notes.txt"), "draft").unwrap();
-        assert_eq!(Repo::changes(&path), Ok(1));
+        assert_eq!(repo.changes(&path), Ok(1));
         assert!(inside.remove_worktree(&path, false).is_err(), "a new file keeps it");
         assert!(path.join("notes.txt").is_file());
 

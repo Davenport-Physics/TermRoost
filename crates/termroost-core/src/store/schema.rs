@@ -82,6 +82,8 @@ const MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL
     );
     "#,
+    // 6: projects on remote hosts
+    "ALTER TABLE projects ADD COLUMN host TEXT;",
 ];
 
 /// Applies connection pragmas used by every connection.

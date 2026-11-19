@@ -559,7 +559,12 @@ mod tests {
             lossy: false,
         };
         let changes = WorkingChanges { unstaged: vec![file], ..WorkingChanges::default() };
-        let repo = Repo { worktree: "/w".into(), git_dir: "/w/.git".into(), common_dir: "/w/.git".into() };
+        let repo = Repo {
+            machine: Default::default(),
+            worktree: "/w".into(),
+            git_dir: "/w/.git".into(),
+            common_dir: "/w/.git".into(),
+        };
         let mut doc = ChangesDoc::new(repo);
         doc.changes = Some(Ok(changes));
         doc

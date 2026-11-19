@@ -99,13 +99,39 @@ fn spawn_detached(command: &mut Command) -> io::Result<std::process::Child> {
     command.spawn()
 }
 
+/// What a terminal reads its helper's frames from: a connection to it, or
+/// a channel to one on a remote host (see [`crate::remote`]).
+pub(crate) trait Duplex: io::Read + Send {
+    /// As [`TcpStream::set_read_timeout`]: a read that waits longer fails
+    /// with `WouldBlock` or `TimedOut`.
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+impl Duplex for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+}
+
+/// What a terminal writes its frames to; see [`Duplex`].
+pub(crate) trait LinkWriter: Write + Send {
+    /// Ends the connection, both ways.
+    fn close(&mut self);
+}
+
+impl LinkWriter for TcpStream {
+    fn close(&mut self) {
+        let _ = self.shutdown(Shutdown::Both);
+    }
+}
+
 /// A connection to a helper, attached.
 pub(crate) struct Connection {
     /// `None` while another client shows the terminal: this one waits
     /// (a `WELCOME` comes when its turn does).
     pub welcome: Option<Welcome>,
-    pub reader: FrameReader<TcpStream>,
-    pub writer: TcpStream,
+    pub reader: FrameReader<Box<dyn Duplex>>,
+    pub writer: Box<dyn LinkWriter>,
 }
 
 pub(crate) enum Connected {
@@ -123,7 +149,14 @@ pub(crate) fn connect(info: &ConnInfo, steal: bool, stay: bool, size: GridSize) 
     let mut writer = stream.try_clone()?;
     let hello = Hello { token: info.token.clone(), version: proto::VERSION, steal, stay, size };
     proto::write_json(&mut writer, proto::HELLO, &hello)?;
-    let mut reader = FrameReader::new(stream);
+    answer(Box::new(stream), Box::new(writer))
+}
+
+/// Reads the helper's answer to a hello sent on `reader`'s connection
+/// (here, or by the remote helper for a channel), within the time a
+/// helper gets to answer, which `reader` must be set to already.
+pub(crate) fn answer(reader: Box<dyn Duplex>, writer: Box<dyn LinkWriter>) -> io::Result<Connected> {
+    let mut reader = FrameReader::new(reader);
     let welcome = match reader.next()? {
         Some(f) if f.kind == proto::WELCOME => Some(proto::parse(&f.payload)?),
         Some(f) if f.kind == proto::PAUSED => None,
@@ -140,7 +173,7 @@ pub(crate) fn end(info: &ConnInfo) -> io::Result<()> {
     match connect(info, true, false, size)? {
         Connected::Attached(mut c) => {
             proto::write_frame(&mut c.writer, proto::END, &[])?;
-            let _ = c.writer.shutdown(Shutdown::Write);
+            c.writer.close();
             Ok(())
         }
         Connected::Refused(r) => Err(io::Error::other(format!("refused: {r:?}"))),
@@ -151,6 +184,8 @@ enum LinkMsg {
     Frame(u8, Vec<u8>),
     /// Disconnect (the helper runs on).
     Detach,
+    /// The connection broke: give the queue back for the next one.
+    Interrupt,
 }
 
 /// Sends to a helper. What is sent before the connection is made waits for
@@ -166,7 +201,7 @@ impl HostLink {
     /// A link, and what its writer takes the messages from once connected.
     pub fn new() -> (HostLink, LinkQueue) {
         let (tx, rx) = mpsc::channel();
-        (HostLink { tx, detached: Arc::new(AtomicBool::new(false)) }, LinkQueue(rx))
+        (HostLink { tx, detached: Arc::new(AtomicBool::new(false)) }, LinkQueue { rx, held: Vec::new() })
     }
 
     pub fn input(&self, bytes: Vec<u8>) {
@@ -200,26 +235,72 @@ impl HostLink {
     pub fn is_detached(&self) -> bool {
         self.detached.load(Ordering::Acquire)
     }
+
+    /// Stops the writer, which gives its queue back (see [`LinkQueue::run`]).
+    pub fn interrupt(&self) {
+        let _ = self.tx.send(LinkMsg::Interrupt);
+    }
 }
 
 /// The messages of a [`HostLink`], for its writer thread.
-pub(crate) struct LinkQueue(Receiver<LinkMsg>);
+pub(crate) struct LinkQueue {
+    rx: Receiver<LinkMsg>,
+    /// Frames kept from a connection that broke, sent first on the next.
+    held: Vec<(u8, Vec<u8>)>,
+}
 
 impl LinkQueue {
-    /// Sends the link's messages over `stream` until it detaches, the link
-    /// is dropped or the connection breaks. Run it on a thread of its own.
-    pub fn run(self, mut stream: TcpStream) {
-        for msg in self.0 {
-            match msg {
-                LinkMsg::Frame(kind, payload) => {
-                    if let Err(e) = proto::write_frame(&mut stream, kind, &payload) {
-                        tracing::debug!(error = %e, "helper connection broke");
-                        break;
-                    }
-                }
-                LinkMsg::Detach => break,
+    /// Sends the link's messages over `writer` until it detaches, the link
+    /// is dropped, the connection breaks or the link is interrupted. Run it
+    /// on a thread of its own. Gives the queue back unless the link is done
+    /// with: for another connection, once a broken one is made again.
+    pub fn run(mut self, mut writer: Box<dyn LinkWriter>) -> Option<LinkQueue> {
+        let held = std::mem::take(&mut self.held);
+        let mut held = held.into_iter();
+        while let Some((kind, payload)) = held.next() {
+            if let Err(e) = proto::write_frame(&mut writer, kind, &payload) {
+                tracing::debug!(error = %e, "helper connection broke");
+                self.held = std::iter::once((kind, payload)).chain(held).collect();
+                writer.close();
+                return Some(self);
             }
         }
-        let _ = stream.shutdown(Shutdown::Both);
+        let back = loop {
+            match self.rx.recv() {
+                Ok(LinkMsg::Frame(kind, payload)) => {
+                    if let Err(e) = proto::write_frame(&mut writer, kind, &payload) {
+                        tracing::debug!(error = %e, "helper connection broke");
+                        // Kept for the next connection, if one is made.
+                        self.held.push((kind, payload));
+                        break true;
+                    }
+                }
+                Ok(LinkMsg::Interrupt) => break true,
+                Ok(LinkMsg::Detach) | Err(_) => break false,
+            }
+        };
+        writer.close();
+        back.then_some(self)
+    }
+
+    /// Readies the queue for another connection after one broke: what was
+    /// typed meanwhile goes out on it (as SSH sends what was typed while it
+    /// stalled), unless `drop_typed` (it would go to another program than
+    /// it was typed for); interruptions of the broken one are dropped.
+    /// Returns whether the link is still wanted: `false` once it detached or
+    /// ended.
+    pub fn recover(&mut self, drop_typed: bool) -> bool {
+        if drop_typed {
+            self.held.clear();
+        }
+        loop {
+            match self.rx.try_recv() {
+                Ok(LinkMsg::Frame(..)) if drop_typed => {}
+                Ok(LinkMsg::Frame(kind, payload)) => self.held.push((kind, payload)),
+                Ok(LinkMsg::Interrupt) => {}
+                Ok(LinkMsg::Detach) | Err(mpsc::TryRecvError::Disconnected) => return false,
+                Err(mpsc::TryRecvError::Empty) => return true,
+            }
+        }
     }
 }

@@ -70,6 +70,15 @@ fn main() -> iced::Result {
     // A terminal's helper process, or a window of its own (see `host_exe`),
     // not the app.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Terminal Rooster's helper on a remote host, started over SSH (this
+    // program copied there when no terminalrooster-remote was at hand).
+    if args.first().is_some_and(|a| a == termroost_core::remote::REMOTE_ARG) {
+        logging::init_stderr();
+        let exe = termroost_core::remote::this_program().expect("this program");
+        let helper =
+            termroost_core::HostCommand { program: exe, args: vec![host_exe::HOST_ARG.to_owned()], env: Vec::new() };
+        std::process::exit(termroost_core::remote::serve(helper));
+    }
     if args.first().is_some_and(|a| a == host_exe::HOST_ARG) {
         let log_guard = logging::init_as(data_dir.as_deref(), "terminalrooster-host");
         let code = termroost_core::host::serve();

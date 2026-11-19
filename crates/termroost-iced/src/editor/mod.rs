@@ -19,7 +19,7 @@ use iced::Task;
 use iced::widget::operation;
 use iced::widget::text_editor::{self, Action, Cursor, Edit, Position};
 use serde::{Deserialize, Serialize};
-use termroost_core::{GridSize, PaneId, TabId, TerminalHandle};
+use termroost_core::{GridSize, PaneId, RemoteStatus, TabId, TerminalHandle};
 
 use crate::app::{App, Dialog, Message, RunningTerminal};
 use crate::git_view::{ChangesDoc, CommitDoc};
@@ -320,6 +320,11 @@ impl App {
         self.editors.iter().find_map(|(tab, f)| Some((*tab, f.open.iter().find(|d| d.id == id)?)))
     }
 
+    /// The computer an open file is on: its session's.
+    fn doc_machine(&self, id: DocId) -> termroost_core::Machine {
+        self.doc(id).map(|(tab, _)| self.core.tab_machine(tab)).unwrap_or_default()
+    }
+
     fn doc_mut(&mut self, id: DocId) -> Option<&mut OpenFile> {
         self.editors.values_mut().flat_map(|f| f.open.iter_mut()).find(|d| d.id == id)
     }
@@ -469,9 +474,10 @@ impl App {
 
     /// Reads a file for the built-in editor, on a thread.
     fn read_doc(&self, id: DocId, path: PathBuf) -> Task<Message> {
+        let machine = self.doc_machine(id);
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let _ = tx.send_blocking(disk::read(&path));
+            let _ = tx.send_blocking(disk::read(&machine, &path));
         });
         Task::perform(async move { rx.recv().await.unwrap_or_else(|_| Err("reading it stopped".into())) }, move |r| {
             Message::Editor(EditorMsg::Loaded(id, r))
@@ -484,14 +490,26 @@ impl App {
     fn launch_editor(&mut self, tab: TabId, path: &Path) -> Option<DocKind> {
         let s = self.core.state();
         let root = s.tab(tab).map(|t| s.tab_working_dir(t))?;
-        let launch = match external::launch_here(&self.prefs.editor_command, path, &root) {
+        let machine = self.core.tab_machine(tab);
+        let launch = match machine.host() {
+            // On the host, over SSH of its own: the editor there, in the folder there.
+            Some(host) => Ok(external::launch_over_ssh(host, path, &root)),
+            None => external::launch_here(&self.prefs.editor_command, path, &root),
+        };
+        let launch = match launch {
             Ok(l) => l,
             Err(e) => {
                 self.error = Some(format!("Can't open {} in an editor: {e}.", self.file_label(Some(tab), path)));
                 return None;
             }
         };
-        match self.core.open_program_terminal(&root, launch.command, launch.env, GridSize::default()) {
+        // A remote session's folder isn't here: ssh starts in this one's home.
+        let here = if machine.is_remote() {
+            directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()).unwrap_or_default()
+        } else {
+            root
+        };
+        match self.core.open_program_terminal(&here, launch.command, launch.env, GridSize::default()) {
             Ok(handle) => Some(DocKind::Terminal { handle, name: launch.name, started: Instant::now() }),
             Err(e) => {
                 self.error = Some(format!("Could not start {}: {e}", launch.name));
@@ -504,9 +522,10 @@ impl App {
     fn reload_doc(&mut self, id: DocId) -> Task<Message> {
         let Some((_, doc)) = self.doc(id) else { return Task::none() };
         let path = doc.path.clone();
+        let machine = self.doc_machine(id);
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let _ = tx.send_blocking(disk::read(&path));
+            let _ = tx.send_blocking(disk::read(&machine, &path));
         });
         Task::perform(async move { rx.recv().await.unwrap_or_else(|_| Err("reading it stopped".into())) }, move |r| {
             Message::Editor(EditorMsg::Reloaded(id, r))
@@ -524,12 +543,15 @@ impl App {
         if self.disk_polling {
             return Task::none();
         }
-        let files: Vec<(DocId, PathBuf, Stamp)> = self
+        let files: Vec<(DocId, termroost_core::Machine, PathBuf, Stamp)> = self
             .editors
-            .values()
-            .flat_map(|f| &f.open)
-            .filter_map(|d| match &d.kind {
-                DocKind::Text(t) if !t.saving => Some((d.id, d.path.clone(), t.disk)),
+            .iter()
+            .map(|(tab, f)| (self.core.tab_machine(*tab), f))
+            // A host that isn't connected isn't asked (nor connected to) for this.
+            .filter(|(machine, _)| machine.host().is_none_or(|h| self.core.remote_status(h) == RemoteStatus::Connected))
+            .flat_map(|(machine, f)| f.open.iter().map(move |d| (machine.clone(), d)))
+            .filter_map(|(machine, d)| match &d.kind {
+                DocKind::Text(t) if !t.saving => Some((d.id, machine, d.path.clone(), t.disk)),
                 _ => None,
             })
             .collect();
@@ -539,8 +561,8 @@ impl App {
         self.disk_polling = true;
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let checked = files.into_iter().map(|(id, path, known)| {
-                let now = disk::check(&path, &known);
+            let checked = files.into_iter().map(|(id, machine, path, known)| {
+                let now = disk::check(&machine, &path, &known);
                 (id, known, now)
             });
             let _ = tx.send_blocking(checked.collect());
@@ -572,6 +594,7 @@ impl App {
     /// Unless `force`, a file that changed on disk is not written over, and
     /// one without changes is not written at all.
     pub(crate) fn save_doc(&mut self, id: DocId, then_close: bool, force: bool) -> Task<Message> {
+        let machine = self.doc_machine(id);
         let Some(OpenFile { path, kind: DocKind::Text(doc), .. }) = self.doc_mut(id) else { return Task::none() };
         doc.close_after_save |= then_close;
         if doc.saving {
@@ -591,7 +614,7 @@ impl App {
         let path = path.clone();
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let _ = tx.send_blocking(disk::write(&path, &bytes, Some(&known), force));
+            let _ = tx.send_blocking(disk::write(&machine, &path, &bytes, Some(&known), force));
         });
         Task::perform(
             async move { rx.recv().await.unwrap_or_else(|_| Err(SaveError::Io("writing it stopped".into()))) },

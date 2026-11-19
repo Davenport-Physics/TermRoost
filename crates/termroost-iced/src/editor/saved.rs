@@ -136,6 +136,7 @@ mod tests {
     fn commits_are_left_out() {
         let commit = |id: u64| {
             let repo = termroost_core::git::Repo {
+                machine: Default::default(),
                 worktree: "/w".into(),
                 git_dir: "/w/.git".into(),
                 common_dir: "/w/.git".into(),

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/termroost-core", "crates/termroost-iced", "crates/termroost-tui", "xtask"]
-default-members = ["crates/termroost-core", "crates/termroost-iced", "crates/termroost-tui"]
+members = ["crates/termroost-core", "crates/termroost-iced", "crates/termroost-tui", "crates/termroost-remote", "xtask"]
+default-members = ["crates/termroost-core", "crates/termroost-iced", "crates/termroost-tui", "crates/termroost-remote"]
 
 [workspace.package]
 version = "0.2.0"

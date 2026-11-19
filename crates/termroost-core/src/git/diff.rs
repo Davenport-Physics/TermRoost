@@ -15,10 +15,13 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
 
+use serde::{Deserialize, Serialize};
+
 use super::{Repo, command, git, spawn_error};
+use crate::remote::wire::GitOp;
 
 /// How a file changed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileStatus {
     Modified,
     Added,
@@ -48,7 +51,7 @@ impl FileStatus {
 }
 
 /// One file's changes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileDiff {
     /// Where the file is after the change (before it, when deleted),
     /// relative to the top of the working tree, with `/` between folders.
@@ -116,7 +119,7 @@ impl FileDiff {
 }
 
 /// A run of changed lines and the unchanged lines around them.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hunk {
     pub old_start: u32,
     pub old_lines: u32,
@@ -135,7 +138,7 @@ impl Hunk {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LineKind {
     Context,
     Added,
@@ -143,7 +146,7 @@ pub enum LineKind {
 }
 
 /// A line of a hunk.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffLine {
     pub kind: LineKind,
     /// The line without its `+`, `-` or space and its line break (a `\r`
@@ -158,7 +161,7 @@ pub struct DiffLine {
 }
 
 /// Someone and when, as a commit records them.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signature {
     pub name: String,
     pub email: String,
@@ -167,7 +170,7 @@ pub struct Signature {
 }
 
 /// A commit and what it changed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitDetails {
     pub id: String,
     /// The commits it was made on: none for the first commit, two or more
@@ -181,7 +184,7 @@ pub struct CommitDetails {
 }
 
 /// What is not committed yet in a working tree.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingChanges {
     /// Staged: the index against HEAD.
     pub staged: Vec<FileDiff>,
@@ -211,6 +214,9 @@ impl Repo {
     /// The commit `id` (anything `git show` takes), its message and what it
     /// changed. A merge shows what it changed against its first parent.
     pub fn commit_details(&self, id: &str) -> Result<CommitDetails, String> {
+        if let Some(out) = self.on_host(GitOp::CommitDetails(id.to_owned()), Err) {
+            return out;
+        }
         let format = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%cn%x1f%ce%x1f%ct%x1f%B%x00";
         let mut args = vec!["-c", "core.quotePath=false", "-c", "log.showSignature=false", "show"];
         args.extend(DIFF_ARGS);
@@ -230,6 +236,9 @@ impl Repo {
 
     /// What is not committed yet: staged, not staged, and untracked.
     pub fn working_changes(&self) -> Result<WorkingChanges, String> {
+        if let Some(out) = self.on_host(GitOp::WorkingChanges, Err) {
+            return out;
+        }
         let diff = |extra: &[&str]| {
             let mut args = vec!["-c", "core.quotePath=false", "diff"];
             args.extend(DIFF_ARGS);
@@ -254,12 +263,20 @@ impl Repo {
     /// Stages these files whole, as they are in the working tree: changed,
     /// new, deleted, or with a conflict resolved.
     pub fn stage_paths<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+        if self.machine.is_remote() {
+            let paths = paths.into_iter().map(str::to_owned).collect();
+            return self.on_host(GitOp::StagePaths(paths), Err).expect("remote");
+        }
         with_pathspecs(&self.worktree, &["add", "-A"], paths)
     }
 
     /// Takes these files out of what is staged, leaving the working tree as
     /// it is. (Both paths of a rename, to unstage it.)
     pub fn unstage_paths<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+        if self.machine.is_remote() {
+            let paths = paths.into_iter().map(str::to_owned).collect();
+            return self.on_host(GitOp::UnstagePaths(paths), Err).expect("remote");
+        }
         if self.head_commit_id().is_none() {
             // Nothing to go back to: what is staged is simply dropped.
             return with_pathspecs(&self.worktree, &["rm", "--cached", "-r", "-q", "--ignore-unmatch"], paths);
@@ -270,12 +287,22 @@ impl Repo {
     /// Stages one hunk of `file`, a file of the unstaged changes; with
     /// `lines`, only those lines of it (indexes into the hunk's lines).
     pub fn stage_hunk(&self, file: &FileDiff, hunk: usize, lines: Option<&BTreeSet<usize>>) -> Result<(), String> {
+        if let Some(out) =
+            self.on_host(GitOp::StageHunk { file: Box::new(file.clone()), hunk, lines: lines.cloned() }, Err)
+        {
+            return out;
+        }
         self.apply_hunk(file, hunk, lines, false)
     }
 
     /// Unstages one hunk of `file`, a file of the staged changes; with
     /// `lines`, only those lines of it.
     pub fn unstage_hunk(&self, file: &FileDiff, hunk: usize, lines: Option<&BTreeSet<usize>>) -> Result<(), String> {
+        if let Some(out) =
+            self.on_host(GitOp::UnstageHunk { file: Box::new(file.clone()), hunk, lines: lines.cloned() }, Err)
+        {
+            return out;
+        }
         self.apply_hunk(file, hunk, lines, true)
     }
 
@@ -303,6 +330,9 @@ impl Repo {
     /// commit instead (with what is staged added to it). Returns what
     /// happened, in a sentence.
     pub fn commit(&self, message: &str, amend: bool) -> Result<String, String> {
+        if let Some(out) = self.on_host(GitOp::Commit { message: message.to_owned(), amend }, Err) {
+            return out;
+        }
         if message.trim().is_empty() {
             return Err("Write a message for the commit first.".into());
         }
@@ -318,6 +348,9 @@ impl Repo {
 
     /// The whole message of the last commit, for amending it.
     pub fn last_message(&self) -> Result<String, String> {
+        if let Some(out) = self.on_host(GitOp::LastMessage, Err) {
+            return out;
+        }
         git(&self.worktree, &["log", "-1", "--format=%B"]).map(|m| m.trim_end().to_owned())
     }
 

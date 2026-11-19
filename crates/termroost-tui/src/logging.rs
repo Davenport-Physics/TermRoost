@@ -34,3 +34,11 @@ pub fn init(data_dir: Option<&Path>) -> Option<WorkerGuard> {
     tracing_subscriber::registry().with(fmt::layer().with_ansi(false).with_writer(writer).with_filter(filter)).init();
     Some(guard)
 }
+
+/// Logs to standard error only: for this program as Terminal Rooster's
+/// helper on a remote host, whose standard error SSH carries back.
+pub fn init_stderr() {
+    let filter = EnvFilter::try_from_env(LOG_ENV).unwrap_or_else(|_| EnvFilter::new("warn,termroost_core=info"));
+    let layer = fmt::layer().with_ansi(false).with_writer(std::io::stderr).with_filter(filter);
+    let _ = tracing_subscriber::registry().with(layer).try_init();
+}

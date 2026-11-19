@@ -152,7 +152,7 @@ impl App {
                 .then(|| repo.tracking(all, LOG_LIMIT))
                 .and_then(|t| t.map_err(|e| tracing::warn!(error = %e, "reading the git remotes failed")).ok());
             // Files change without refs moving: counted every time.
-            let changes = Repo::changes(&repo.worktree).ok();
+            let changes = repo.changes(&repo.worktree).ok();
             let _ = tx.send_blocking(LogRead { worktree: repo.worktree, all, stamp, commits, tracking, changes });
         });
         Task::perform(async move { rx.recv().await.ok() }, |read| match read {

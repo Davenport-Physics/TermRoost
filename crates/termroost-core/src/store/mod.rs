@@ -168,11 +168,11 @@ fn apply(c: &Connection, op: &StoreOp) -> rusqlite::Result<()> {
     match op {
         StoreOp::UpsertProject(p) => {
             c.execute(
-                "INSERT INTO projects (id, name, working_dir, shell, sort_order, active_tab_id, group_id, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO projects (id, name, working_dir, shell, sort_order, active_tab_id, group_id, created_at, host)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(id) DO UPDATE SET name = excluded.name, working_dir = excluded.working_dir,
                    shell = excluded.shell, sort_order = excluded.sort_order,
-                   active_tab_id = excluded.active_tab_id, group_id = excluded.group_id",
+                   active_tab_id = excluded.active_tab_id, group_id = excluded.group_id, host = excluded.host",
                 params![
                     p.id.0,
                     p.name,
@@ -181,7 +181,8 @@ fn apply(c: &Connection, op: &StoreOp) -> rusqlite::Result<()> {
                     p.sort_order,
                     p.active_tab.map(|t| t.0),
                     p.group.map(|g| g.0),
-                    p.created_at
+                    p.created_at,
+                    p.host
                 ],
             )?;
         }
@@ -313,7 +314,7 @@ fn load(c: &Connection) -> rusqlite::Result<AppState> {
     let mut state = AppState::default();
 
     let mut stmt = c.prepare(
-        "SELECT id, name, working_dir, shell, sort_order, active_tab_id, group_id, created_at FROM projects",
+        "SELECT id, name, working_dir, shell, sort_order, active_tab_id, group_id, created_at, host FROM projects",
     )?;
     state.projects = stmt
         .query_map([], |r| {
@@ -326,6 +327,7 @@ fn load(c: &Connection) -> rusqlite::Result<AppState> {
                 active_tab: r.get::<_, Option<i64>>(5)?.map(TabId),
                 group: r.get::<_, Option<i64>>(6)?.map(GroupId),
                 created_at: r.get(7)?,
+                host: r.get(8)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -452,6 +454,7 @@ mod tests {
             name: "api".into(),
             working_dir: "/tmp/api".into(),
             shell: None,
+            host: None,
             sort_order: 0,
             active_tab: Some(TabId(10)),
             group: None,
@@ -567,6 +570,7 @@ mod tests {
             name: "renamed".into(),
             working_dir: "/tmp/api".into(),
             shell: None,
+            host: None,
             sort_order: 0,
             active_tab: Some(TabId(10)),
             group: None,
@@ -593,6 +597,7 @@ mod tests {
             name: "api".into(),
             working_dir: "/tmp/api".into(),
             shell: None,
+            host: None,
             sort_order: 0,
             active_tab: Some(TabId(10)),
             group: Some(group.id),

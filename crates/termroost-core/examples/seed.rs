@@ -20,7 +20,7 @@ fn main() {
     for (i, dir) in dirs.iter().enumerate() {
         let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| format!("project {i}"));
         let Outcome::Project(project) =
-            core.dispatch(Command::CreateProject { name, working_dir: dir.clone(), shell: None }).unwrap()
+            core.dispatch(Command::CreateProject { name, working_dir: dir.clone(), shell: None, host: None }).unwrap()
         else {
             unreachable!()
         };

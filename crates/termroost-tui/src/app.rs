@@ -15,8 +15,8 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 use termroost_core::{
-    Alert, Axis, Command, Core, Event, Layout, MouseEventKind, MouseInput, Outcome, PaneId, ProjectId, SelectionKind,
-    TabId, TerminalHandle, git,
+    Alert, Axis, Command, Core, Event, Layout, MouseEventKind, MouseInput, Outcome, PaneId, ProjectId, RemoteStatus,
+    SelectionKind, TabId, TerminalHandle, git,
 };
 
 use crate::panes::{Divider, Placed};
@@ -28,6 +28,21 @@ pub enum Msg {
     Core(Event),
     /// The keyboard can't be read any more.
     InputClosed,
+    /// SSH host `host` said where the folder asked for is, or why not.
+    Resolved {
+        host: String,
+        result: Result<PathBuf, String>,
+    },
+}
+
+/// What to show at start: a folder's project (adding it if there is none).
+pub enum Open {
+    Here(PathBuf),
+    /// A folder of an SSH host, as typed (`~/app`).
+    Remote {
+        host: String,
+        path: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,10 +140,12 @@ pub struct App {
     last_click: Option<(Instant, PaneId, u16, u16, u8)>,
     /// The terminal last told it has the keyboard.
     keyboard: Option<PaneId>,
+    /// Where answers from other threads go (see [`Msg::Resolved`]).
+    msgs: std::sync::mpsc::Sender<Msg>,
 }
 
 impl App {
-    pub fn new(core: Core, launch_dir: PathBuf, open: Option<PathBuf>) -> App {
+    pub fn new(core: Core, launch_dir: PathBuf, open: Option<Open>, msgs: std::sync::mpsc::Sender<Msg>) -> App {
         let focus = if core.state().active_tab().is_some() { Focus::Terminal } else { Focus::List };
         let mut app = App {
             core,
@@ -153,11 +170,13 @@ impl App {
             drag: None,
             last_click: None,
             keyboard: None,
+            msgs,
         };
-        if let Some(dir) = open {
-            app.open_folder(dir);
-        } else if app.core.state().projects.is_empty() {
-            app.start_new_project();
+        match open {
+            Some(Open::Here(dir)) => app.open_folder(None, dir),
+            Some(Open::Remote { host, path }) => app.open_remote(host, path),
+            None if app.core.state().projects.is_empty() => app.start_new_project(),
+            None => {}
         }
         app.settle();
         app
@@ -171,6 +190,16 @@ impl App {
             }
             Msg::Core(ev) => self.core_event(ev),
             Msg::InputClosed => self.quit = true,
+            Msg::Resolved { host, result } => {
+                match result {
+                    Ok(dir) => {
+                        self.note = None;
+                        self.open_folder(Some(host), dir);
+                    }
+                    Err(e) => self.problem(e),
+                }
+                self.dirty = true;
+            }
         }
         self.settle();
     }
@@ -308,6 +337,14 @@ impl App {
                     self.alerts.insert(pane, alert);
                 }
             }
+            Event::Remote { host, status } => match status {
+                RemoteStatus::Copying => {
+                    self.note =
+                        Some((Note::Done(format!("Copying Terminal Rooster's helper to {host}…")), Instant::now()))
+                }
+                RemoteStatus::Failed(e) => self.problem(e),
+                _ => {}
+            },
             Event::Bell(_)
             | Event::CodexHookReported
             | Event::AgentObserved { .. }
@@ -434,9 +471,13 @@ impl App {
             },
             Edit::NewProject { field, error } => match k.code {
                 KeyCode::Enter => {
-                    let dir = folders::resolve(&field.text(), &self.launch_dir, self.home.as_deref());
+                    let text = field.text();
+                    let dir = folders::resolve(&text, &self.launch_dir, self.home.as_deref());
                     if dir.is_dir() {
-                        self.open_folder(dir);
+                        self.open_folder(None, dir);
+                        false
+                    } else if let Some((host, path)) = folders::split_remote(&text) {
+                        self.open_remote(host, path);
                         false
                     } else {
                         *error = Some("No such folder");
@@ -445,7 +486,12 @@ impl App {
                 }
                 KeyCode::Esc => false,
                 KeyCode::Tab => {
-                    if let Some(done) = folders::complete(&field.text(), &self.launch_dir, self.home.as_deref()) {
+                    let text = field.text();
+                    let done = match folders::split_remote(&text) {
+                        Some((host, path)) => self.complete_remote(&host, &path).map(|p| format!("{host}:{p}")),
+                        None => folders::complete(&text, &self.launch_dir, self.home.as_deref()),
+                    };
+                    if let Some(done) = done {
                         field.set(&done);
                         *error = None;
                     }
@@ -643,10 +689,44 @@ impl App {
         self.focus = Focus::List;
     }
 
-    /// Shows the project working in `dir`, adding one if there is none.
-    fn open_folder(&mut self, dir: PathBuf) {
+    /// Asks SSH host `host` where folder `path` is there (on a thread:
+    /// connecting takes a moment); its project is shown once it answers.
+    fn open_remote(&mut self, host: String, path: String) {
+        if let Err(e) = termroost_core::remote::check_host(&host) {
+            return self.problem(e);
+        }
+        self.note = Some((Note::Done(format!("Connecting to {host}…")), Instant::now()));
+        let machine = self.core.machine(Some(&host));
+        let msgs = self.msgs.clone();
+        std::thread::spawn(move || {
+            let result = machine.resolve_dir(Path::new(&path));
+            let _ = msgs.send(Msg::Resolved { host, result });
+        });
+    }
+
+    /// Tab completion of a folder on SSH host `host`, while connected
+    /// (asking it to connect would hold up the keyboard).
+    fn complete_remote(&self, host: &str, path: &str) -> Option<String> {
+        if self.core.remote_status(host) != RemoteStatus::Connected || !path.starts_with('/') {
+            return None;
+        }
+        let found = self.core.machine(Some(host)).complete_dir(path, 200);
+        let names =
+            found.iter().filter_map(|f| f.trim_end_matches('/').rsplit('/').next().map(str::to_owned)).collect();
+        folders::complete_from(path, names)
+    }
+
+    /// Shows the project working in `dir` (on SSH host `host`, or this
+    /// computer), adding one if there is none.
+    fn open_folder(&mut self, host: Option<String>, dir: PathBuf) {
         let dir: PathBuf = dir.components().collect();
-        let existing = self.core.state().projects.iter().find(|p| git::same_path(&p.working_dir, &dir)).map(|p| p.id);
+        let existing = self
+            .core
+            .state()
+            .projects
+            .iter()
+            .find(|p| p.host == host && git::same_path(&p.working_dir, &dir))
+            .map(|p| p.id);
         match existing {
             Some(p) => {
                 self.select(Row::Project(p));
@@ -659,7 +739,7 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| dir.display().to_string());
-                self.dispatch(Command::CreateProject { name, working_dir: dir, shell: None });
+                self.dispatch(Command::CreateProject { name, working_dir: dir, shell: None, host });
             }
         }
         self.cursor = None;

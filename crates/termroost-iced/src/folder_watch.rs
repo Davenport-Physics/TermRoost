@@ -79,6 +79,9 @@ impl Changes {
 /// The watches of the folders shown.
 pub struct FolderWatch {
     watcher: Option<RecommendedWatcher>,
+    /// The folders are on a remote host: none is watched, all are read again
+    /// now and then (see [`FolderWatch::poll_only`]).
+    remote: bool,
     /// The folders asked for, watched or not.
     wanted: HashSet<PathBuf>,
     /// Those of them that could not be watched.
@@ -90,6 +93,7 @@ impl Default for FolderWatch {
     fn default() -> Self {
         FolderWatch {
             watcher: None,
+            remote: false,
             wanted: HashSet::new(),
             failed: HashSet::new(),
             changes: async_channel::unbounded(),
@@ -120,6 +124,10 @@ impl FolderWatch {
     /// Watches exactly the folders in `wanted` (each with what is inside it,
     /// if [`WHOLE_TREE`]). Nothing wanted lets the watcher go.
     pub fn set(&mut self, wanted: HashSet<PathBuf>) {
+        if std::mem::take(&mut self.remote) {
+            self.wanted.clear();
+            self.failed.clear();
+        }
         if wanted == self.wanted {
             return;
         }
@@ -152,6 +160,15 @@ impl FolderWatch {
                 self.failed.insert(new.clone());
             }
         }
+        self.wanted = wanted;
+    }
+
+    /// Takes folders that can't be watched from here (those of a remote
+    /// host): they are all read again now and then instead.
+    pub fn poll_only(&mut self, wanted: HashSet<PathBuf>) {
+        self.watcher = None;
+        self.remote = true;
+        self.failed = wanted.clone();
         self.wanted = wanted;
     }
 

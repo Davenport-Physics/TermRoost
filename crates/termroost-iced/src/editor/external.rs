@@ -65,6 +65,24 @@ pub fn quit_keys(name: &str) -> Option<&'static [u8]> {
     vim.then_some(b"\x1c\x0e:qa\r".as_slice())
 }
 
+/// Edits `file` on SSH host `host`, in a terminal here running `ssh`:
+/// Neovim there, else Vim, started in `root` (the session's folder there).
+pub fn launch_over_ssh(host: &str, file: &Path, root: &Path) -> Launch {
+    let (dir, file) = (sh_quote(&root.display().to_string()), sh_quote(&file_arg(file, root)));
+    let script = format!(
+        "cd {dir} 2>/dev/null; if command -v nvim >/dev/null 2>&1; then exec nvim {file}; else exec vim {file}; fi"
+    );
+    let ssh = std::env::var(termroost_core::remote::SSH_ENV).ok().filter(|p| !p.is_empty()).unwrap_or("ssh".into());
+    // Run by the login shell there, whichever it is: all of it goes to sh.
+    let args = vec!["-t".into(), "--".into(), host.to_owned(), format!("exec sh -c {}", sh_quote(&script))];
+    Launch { command: ShellCommand { program: ssh, args }, env: Vec::new(), name: "nvim".into() }
+}
+
+/// `s` in single quotes for `sh`, as one word.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// [`launch`] with the editor and `PATH` of this machine.
 pub fn launch_here(setting: &str, file: &Path, root: &Path) -> Result<Launch, String> {
     let path = std::env::var_os("PATH").unwrap_or_default();
@@ -74,6 +92,17 @@ pub fn launch_here(setting: &str, file: &Path, root: &Path) -> Result<Launch, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_files_open_in_the_hosts_editor() {
+        let l = launch_over_ssh("droplet", Path::new("/srv/app/src/it's.rs"), Path::new("/srv/app"));
+        assert_eq!(l.command.args[..3], ["-t", "--", "droplet"]);
+        let script = &l.command.args[3];
+        assert!(script.starts_with("exec sh -c '"), "{script}");
+        assert!(script.contains("nvim"), "{script}");
+        assert_eq!(sh_quote("it's"), r"'it'\''s'");
+        assert_eq!(quit_keys(&l.name), quit_keys("nvim"));
+    }
 
     fn nvim() -> Option<EditorProgram> {
         Some(EditorProgram { program: PathBuf::from("/opt/nvim/bin/nvim"), env: Vec::new() })

@@ -11,7 +11,7 @@ use crate::keymap::Action;
 use crate::leave_room::leave_room;
 use crate::notify::Category;
 use crate::side_panel::SideTab;
-use crate::sidebar::{branch_label, muted_text, short_dir};
+use crate::sidebar::{branch_label, muted_text, place_label, place_path};
 use crate::terminal_view::TerminalView;
 use crate::theme::{self, SEMIBOLD, Tone};
 use crate::ui::{self, ICON_BUTTON_WIDTH, icon_button, tip};
@@ -82,9 +82,10 @@ impl App {
             header = header.push(branch_label(head, 12.0, 40));
         }
         let dir = s.tab_working_dir(tab);
+        let machine = self.core.tab_machine(tab.id);
         let mut place = row![
-            muted_text(short_dir(&dir, 70)).wrapping(text::Wrapping::None),
-            icon_button(Icon::Copy, Message::CopyText(dir.display().to_string()), "Copy path"),
+            muted_text(place_label(&machine, &dir, 70)).wrapping(text::Wrapping::None),
+            icon_button(Icon::Copy, Message::CopyText(place_path(&machine, &dir)), "Copy path"),
         ]
         .spacing(2)
         .align_y(Alignment::Center);
@@ -208,7 +209,8 @@ impl App {
         title_row = title_row.push(container(text(title).size(12).wrapping(text::Wrapping::None)).clip(true));
 
         let k = &self.keymap;
-        let pop_out = (keeps_running && !elsewhere && crate::host_exe::WINDOWS_OF_THEIR_OWN)
+        let remote = handle.as_ref().is_some_and(|h| h.remote().is_some());
+        let pop_out = (keeps_running && !elsewhere && !remote && crate::host_exe::WINDOWS_OF_THEIR_OWN)
             .then(|| icon_button(Icon::Open, Message::OpenInWindow(pane), "Open in its own window"));
         let full = row![
             pick_list(&AgentKind::ALL[..], None::<AgentKind>, move |k| Message::StartAgent(pane, k))

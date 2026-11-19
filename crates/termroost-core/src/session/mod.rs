@@ -16,7 +16,7 @@ pub(crate) use snapshot::{just_a_prompt, without_restore_banners};
 #[cfg(windows)]
 pub(crate) use terminal::quote_program;
 pub use terminal::{Activity, GridSize, SelectionKind, TerminalHandle};
-pub(crate) use terminal::{HostPlan, NewHost, SpawnSpec, resize_like_conpty};
+pub(crate) use terminal::{HostPlan, NewHost, RemotePlan, SpawnSpec, resize_like_conpty};
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -90,19 +90,41 @@ impl Background {
         let handles: Vec<TerminalHandle> = self.sessions.lock().unwrap().values().cloned().collect();
         let mut shells = Vec::new();
         let mut submits = HashMap::new();
+        // Remote terminals, by host: their hosts look.
+        let mut remote: HashMap<String, (crate::RemoteHost, Vec<(PaneId, u32)>)> = HashMap::new();
         for h in &handles {
-            if let Some(pid) = h.shell_pid() {
+            if let Some(host) = h.remote() {
+                if let Some(pid) = h.remote_shell_pid() {
+                    remote
+                        .entry(host.name().to_owned())
+                        .or_insert_with(|| (host.clone(), Vec::new()))
+                        .1
+                        .push((h.pane(), pid));
+                }
+            } else if let Some(pid) = h.shell_pid() {
                 shells.push((h.pane(), pid));
                 submits.insert(h.pane(), h.submits());
             }
         }
         let mut detector = self.detector.lock().unwrap();
-        let changes = detector.scan_with(&shells, &submits, &reports);
+        let mut changes = detector.scan_with(&shells, &submits, &reports);
         // The same look at the processes.
         let mut programs = detector.programs_seen(&shells);
         drop(detector);
-        for h in &handles {
+        for h in handles.iter().filter(|h| h.remote().is_none()) {
             h.set_programs(programs.remove(&h.pane()).unwrap_or_default());
+        }
+        for (host, shells) in remote.into_values() {
+            // A host that isn't connected now isn't asked; what was seen last stays.
+            let request = crate::remote::wire::Request::Scan(shells);
+            let Some(scan) = host.call_if_up::<crate::remote::wire::Scan>(request, Duration::from_secs(10)) else {
+                continue;
+            };
+            let mut found = scan.programs;
+            for h in handles.iter().filter(|h| h.remote() == Some(&host)) {
+                h.set_programs(found.remove(&h.pane()).unwrap_or_default());
+            }
+            changes.extend(scan.changes);
         }
         for (pane, agent) in &changes {
             match agent {

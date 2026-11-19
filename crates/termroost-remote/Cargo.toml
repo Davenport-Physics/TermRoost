@@ -1,0 +1,18 @@
+[package]
+name = "termroost-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Terminal Rooster's helper on a remote host, which it starts over SSH"
+repository = "https://github.com/Davenport-Physics/TermRoost"
+
+[[bin]]
+name = "terminalrooster-remote"
+path = "src/main.rs"
+
+[dependencies]
+termroost-core.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

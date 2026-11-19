@@ -6,7 +6,7 @@ use std::path::Path;
 use iced::widget::{MouseArea, button, column, container, hover, mouse_area, row, space, stack, text, tooltip};
 use iced::{Alignment, Element, Length, Padding};
 use termroost_core::git::Head;
-use termroost_core::{AgentKind, PaneId, Project, ProjectGroup, Tab, TabId};
+use termroost_core::{AgentKind, Machine, PaneId, Project, ProjectGroup, RemoteStatus, Tab, TabId};
 
 use crate::agent_icon::{agent_icon, terminal_icon};
 use crate::app::{App, DropTarget, Message, PROJECT_SEARCH, RENAME_INPUT, RenameTarget};
@@ -74,7 +74,34 @@ pub fn display_dir(path: &std::path::Path) -> String {
 
 /// Like [`display_dir`], but keeps only the trailing components that fit in `max` characters.
 pub fn short_dir(path: &std::path::Path, max: usize) -> String {
-    let full = display_dir(path);
+    shorten(display_dir(path), max)
+}
+
+/// A folder of a computer as it is shown: as [`short_dir`] on this one; on a
+/// remote host after its name, scp style (`droplet:~/app`), with `~` for the
+/// home folder there once it is known.
+pub fn place_label(machine: &Machine, path: &Path, max: usize) -> String {
+    let Machine::Remote(host) = machine else { return short_dir(path, max) };
+    let shown = match host.home().and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf)) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    };
+    let name = host.name();
+    format!("{name}:{}", shorten(shown, max.saturating_sub(name.chars().count() + 1).max(8)))
+}
+
+/// `path` with the host in front for a remote one (`droplet:/srv/app`), as
+/// `scp` and `rsync` take it.
+pub fn place_path(machine: &Machine, path: &Path) -> String {
+    match machine.host() {
+        Some(host) => format!("{host}:{}", path.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// Keeps only the trailing parts of the path `full` that fit in `max` characters.
+fn shorten(full: String, max: usize) -> String {
     if full.chars().count() <= max {
         return full;
     }
@@ -149,8 +176,8 @@ fn item_actions<'a>(selected: bool, edit: (Message, &'a str), delete: (Message, 
 /// A button that copies `dir`, for over the end of the folder line that ends a
 /// list item. It sits on the item's own fill, which hides the end of a long
 /// folder rather than letting it run under the button.
-fn copy_dir_button<'a>(dir: &Path, selected: bool) -> Element<'a, Message> {
-    let copy = icon_button(Icon::Copy, Message::CopyText(dir.display().to_string()), "Copy path");
+fn copy_dir_button<'a>(dir: String, selected: bool) -> Element<'a, Message> {
+    let copy = icon_button(Icon::Copy, Message::CopyText(dir), "Copy path");
     let copy = container(copy).padding(Padding { left: 4.0, ..Padding::ZERO }).style(theme::list_item_cover(selected));
     // Centered on the folder's line.
     let line = text::LineHeight::default().to_absolute(MUTED_SIZE.into()).0;
@@ -199,6 +226,24 @@ fn marker<'a>(notice: Option<&Notice>, activity: bool) -> Element<'a, Message> {
 }
 
 impl App {
+    /// For a remote project whose host isn't connected: a line saying so,
+    /// with why in its tooltip when connecting failed.
+    fn connection_note<'a>(&self, p: &Project) -> Option<Element<'a, Message>> {
+        let host = p.host.as_deref()?;
+        let (line, tone, why) = match self.core.remote_status(host) {
+            RemoteStatus::Connecting => ("connecting…", Tone::Warning, None),
+            RemoteStatus::Copying => ("copying Terminal Rooster's helper there…", Tone::Warning, None),
+            RemoteStatus::Lost => ("connection lost", Tone::Warning, None),
+            RemoteStatus::Failed(e) => ("can't connect", Tone::Danger, Some(e)),
+            RemoteStatus::Idle | RemoteStatus::Connected => return None,
+        };
+        let note = text(line).size(MUTED_SIZE).wrapping(text::Wrapping::None).style(theme::toned(tone));
+        Some(match why {
+            Some(why) => tip(note, why, tooltip::Position::Bottom),
+            None => note.into(),
+        })
+    }
+
     /// The alert to show for a set of terminals: a failure before an agent.
     fn notice_of(&self, panes: impl IntoIterator<Item = PaneId>) -> Option<&Notice> {
         let found: Vec<&Notice> = panes.into_iter().filter_map(|p| self.notices.get(&p)?.first()).collect();
@@ -344,6 +389,7 @@ impl App {
             return input;
         }
         let s = self.core.state();
+        let machine = self.core.project_machine(p.id);
         let selected = s.selected_project == Some(p.id);
         let new_output = s.tabs_of(p.id).any(|t| self.activity.contains(&t.id));
         let notice = self.notice_of(s.tabs_of(p.id).flat_map(|t| t.layout.panes()));
@@ -358,13 +404,17 @@ impl App {
             .align_y(Alignment::Center),
             // Cut at the item's edge, where the copy button covers its end:
             // a long folder name would otherwise run on past the button.
-            container(muted_text(short_dir(&p.working_dir, 24)).wrapping(text::Wrapping::None)).clip(true),
+            container(muted_text(place_label(&machine, &p.working_dir, 24)).wrapping(text::Wrapping::None)).clip(true),
         ]
         .spacing(1);
+        let label = match self.connection_note(p) {
+            Some(note) => label.push(note),
+            None => label,
+        };
         // The folder can be copied without opening the project, from a button
         // that shows while the pointer is over it.
         let label = container(label).padding(ITEM_PADDING).width(Length::Fill);
-        let body = mouse_area(hover(label, copy_dir_button(&p.working_dir, selected)))
+        let body = mouse_area(hover(label, copy_dir_button(place_path(&machine, &p.working_dir), selected)))
             .on_press(Message::SelectProject(p.id))
             .on_double_click(Message::StartRename(RenameTarget::Project(p.id)));
         let actions = item_actions(
@@ -383,7 +433,8 @@ impl App {
         let mut header = row![
             column![
                 text(&project.name).size(15).font(SEMIBOLD),
-                muted_text(short_dir(&project.working_dir, 26)).wrapping(text::Wrapping::None)
+                muted_text(place_label(&self.core.project_machine(project.id), &project.working_dir, 26))
+                    .wrapping(text::Wrapping::None)
             ]
             .spacing(1)
             .width(Length::Fill),

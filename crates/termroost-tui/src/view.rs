@@ -335,8 +335,14 @@ impl App {
 
         let s = self.core.state();
         let dir: PathBuf = s.pane(placed.pane).and_then(|p| p.cwd.clone()).unwrap_or_else(|| s.tab_working_dir(tab));
-        let place = folders::pretty(&dir, self.home.as_deref());
-        let branch = self.branch(&dir);
+        let machine = self.core.tab_machine(tab.id);
+        let (place, branch) = match &machine {
+            // As scp takes it; the branch there isn't asked for while drawing.
+            termroost_core::Machine::Remote(host) => {
+                (format!("{}:{}", host.name(), folders::pretty(&dir, host.home().as_deref())), None)
+            }
+            termroost_core::Machine::Local => (folders::pretty(&dir, self.home.as_deref()), self.branch(&dir)),
+        };
         let title = handle.as_ref().and_then(|h| h.title()).and_then(|t| telling(&t).map(str::to_owned));
         let exited = handle.as_ref().and_then(|h| h.exit_status());
 

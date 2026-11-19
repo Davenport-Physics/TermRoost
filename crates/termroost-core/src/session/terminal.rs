@@ -20,9 +20,12 @@ use crate::agent::AgentKind;
 use crate::alert::{Alert, Tracker};
 use crate::command::Event;
 use crate::detect::Program;
-use crate::host::client::{self, Connected, Connection, HostCommand, HostLink, LinkQueue};
+use crate::host::client::{self, Connected, Connection, Duplex, HostCommand, HostLink, LinkQueue};
 use crate::host::proto::{self, ConnInfo, Exited, FrameReader, Refusal, Spec, Welcome};
 use crate::model::PaneId;
+use crate::remote::RemoteHost;
+use crate::remote::client::OpenError;
+use crate::remote::wire::{OpenMode, OpenTerminal, Resume};
 use crate::session::input::{self, KeyInput, MouseInput};
 use crate::session::osc::OscScanner;
 use crate::session::osc::Signal;
@@ -31,8 +34,12 @@ use crate::session::shell::ShellCommand;
 use crate::session::snapshot;
 use crate::session::tap::TapPty;
 use alacritty_terminal::vte::ansi::Processor;
-use std::net::TcpStream;
 use std::time::{Duration, Instant};
+
+/// How long a remote terminal's helper gets to answer once found.
+const REMOTE_ANSWER_TIMEOUT: Duration = Duration::from_secs(15);
+/// The longest wait between attempts to reach a host again.
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 /// Size of the terminal grid and of one cell in pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -158,6 +165,15 @@ pub(crate) struct HostPlan {
     pub start: Option<NewHost>,
 }
 
+/// How a terminal of a remote host is shown (see [`TerminalHandle::attach_remote`]).
+pub(crate) struct RemotePlan {
+    pub host: RemoteHost,
+    pub open: OpenTerminal,
+    /// How much of the scrollback a helper started anew gets, after the
+    /// connection broke and the helper was gone.
+    pub preload_lines: usize,
+}
+
 /// How to start a helper for a terminal.
 pub(crate) struct NewHost {
     pub command: HostCommand,
@@ -209,6 +225,11 @@ pub(crate) struct Shared {
     /// PTYs of the core's terminals that are open, or closed with their shell
     /// not seen gone yet (see `tap::EndShell`).
     pub(crate) ptys: Arc<std::sync::atomic::AtomicUsize>,
+    /// The host it runs on, for a terminal of a remote project.
+    remote: std::sync::OnceLock<RemoteHost>,
+    /// What a remote terminal types should its helper there be gone when
+    /// the connection comes back (the host restarted): as after a restart.
+    resume: Mutex<Resume>,
 }
 
 impl Shared {
@@ -447,6 +468,8 @@ impl TerminalHandle {
             cwd: Mutex::new(None),
             pin: Mutex::new(Pin::Off),
             ptys,
+            remote: std::sync::OnceLock::new(),
+            resume: Mutex::new(Resume::default()),
         });
         let config = term::Config { scrolling_history: scrollback_lines, ..Default::default() };
         let term = Term::new(config, &size, Proxy { shared: shared.clone(), run: None });
@@ -527,6 +550,34 @@ impl TerminalHandle {
     /// needed, in place of what ran here (which ends). Connects on a thread
     /// of its own; what is typed meanwhile waits for the connection.
     pub(crate) fn attach_host(&self, plan: HostPlan) {
+        self.attach_with(move |session, run, link, queue| run_host_link(session, run, plan, link, queue));
+    }
+
+    /// Shows a terminal of a remote host, which runs there under a helper
+    /// of its own (see [`crate::remote`]), in place of what ran here. Its
+    /// thread connects, and connects again whenever the connection breaks.
+    pub(crate) fn attach_remote(&self, plan: RemotePlan) {
+        let _ = self.0.shared.remote.set(plan.host.clone());
+        self.attach_with(move |session, run, link, queue| run_remote_link(session, run, plan, link, queue));
+    }
+
+    /// The host of a remote terminal.
+    pub fn remote(&self) -> Option<&RemoteHost> {
+        self.0.shared.remote.get()
+    }
+
+    /// Marks this as a terminal of `host` before it is shown (see [`Self::attach_remote`]).
+    pub(crate) fn set_remote(&self, host: RemoteHost) {
+        let _ = self.0.shared.remote.set(host);
+    }
+
+    /// What a remote terminal types if it has to start anew, see [`Shared::resume`].
+    pub(crate) fn set_resume(&self, resume: Resume) {
+        *self.0.shared.resume.lock().unwrap() = resume;
+    }
+
+    /// Runs `connect` on a thread of its own as the terminal's link to a helper.
+    fn attach_with(&self, connect: impl FnOnce(&Arc<Session>, u64, &HostLink, LinkQueue) + Send + 'static) {
         let shared = &self.0.shared;
         if let Some(old) = shared.link.lock().unwrap().take() {
             old.detach();
@@ -543,7 +594,7 @@ impl TerminalHandle {
         let session = self.0.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("host-link-{}", shared.pane))
-            .spawn(move || run_host_link(&session, run, plan, &link, queue));
+            .spawn(move || connect(&session, run, &link, queue));
         if let Err(e) = spawned {
             tracing::error!(pane = %shared.pane, error = %e, "could not connect to the terminal's helper");
             shared.mark_exited(Some(run), None);
@@ -613,8 +664,18 @@ impl TerminalHandle {
         self.0.shared.submits.lock().unwrap().iter().copied().collect()
     }
 
-    /// Process id of the running shell.
+    /// Process id of the running shell, on this computer: `None` for a
+    /// terminal of a remote host (see [`Self::remote_shell_pid`]).
     pub fn shell_pid(&self) -> Option<u32> {
+        if self.remote().is_some() {
+            return None;
+        }
+        Some(self.0.shared.shell_pid.load(Ordering::Acquire)).filter(|p| *p != 0)
+    }
+
+    /// Process id of the running shell of a remote terminal, on its host.
+    pub(crate) fn remote_shell_pid(&self) -> Option<u32> {
+        self.remote()?;
         Some(self.0.shared.shell_pid.load(Ordering::Acquire)).filter(|p| *p != 0)
     }
 
@@ -973,20 +1034,177 @@ fn run_host_link(session: &Arc<Session>, run: u64, plan: HostPlan, link: &HostLi
     let Connection { welcome, reader, writer } = conn;
     // What was queued goes out (an `END` too, should the terminal have been
     // closed meanwhile).
-    std::thread::Builder::new().name(format!("host-writer-{}", shared.pane)).spawn(move || queue.run(writer)).ok();
+    std::thread::Builder::new()
+        .name(format!("host-writer-{}", shared.pane))
+        .spawn(move || {
+            queue.run(writer);
+        })
+        .ok();
     if link.is_detached() || !shared.is_run(run) {
         return;
     }
     tracing::info!(pane = %shared.pane, waits = welcome.is_none(), fresh = fresh.is_some(), "connected to the terminal's helper");
     if let Some(Some(line)) = &fresh {
-        let handle = TerminalHandle(session.clone());
-        let line = line.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(400));
-            handle.write(format!("{line}\r"));
-        });
+        type_soon(session, line.clone());
     }
-    read_host(session, run, reader, link, welcome, fresh.is_some());
+    if read_host(session, run, reader, link, welcome, fresh.is_some()) == HostEnd::Lost {
+        shared.mark_exited(Some(run), None);
+    }
+}
+
+/// Types `line` into a program that just started, once it had a moment.
+fn type_soon(session: &Arc<Session>, line: String) {
+    let handle = TerminalHandle(session.clone());
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        handle.write(format!("{line}\r"));
+    });
+}
+
+/// Shows a remote terminal (see [`TerminalHandle::attach_remote`]): opens
+/// its channel, and opens it again each time the connection breaks, until
+/// the program ends or the terminal lets go. Runs on a thread of its own.
+fn run_remote_link(session: &Arc<Session>, run: u64, plan: RemotePlan, link: &HostLink, queue: LinkQueue) {
+    let shared = &session.shared;
+    let notice = |text: &str| TerminalHandle(session.clone()).print_notice(text);
+    let RemotePlan { host, mut open, preload_lines } = plan;
+    let mut queue = queue;
+    let mut wait = Duration::from_secs(2);
+    // A notice says the connection is being made again.
+    let mut retrying = false;
+    // The connection broke since the terminal was first shown.
+    let mut broke = false;
+    // The wait before trying again after the connection broke as the channel opened.
+    let mut lost_wait = Duration::from_millis(200);
+    loop {
+        if link.is_detached() || !shared.is_run(run) {
+            return;
+        }
+        open.size = *shared.size.lock().unwrap();
+        let (opened, reader, writer) = match host.open_terminal(open.clone()) {
+            Ok(channel) => channel,
+            Err(OpenError::Failed(e)) => {
+                tracing::warn!(pane = %shared.pane, host = host.name(), error = %e, "remote terminal refused");
+                notice(&e);
+                shared.mark_exited(Some(run), None);
+                return;
+            }
+            // It broke as the channel was opened: a new one can be made at once.
+            Err(OpenError::Lost) => {
+                if !wait_unless_detached(link, lost_wait) {
+                    return;
+                }
+                lost_wait = (lost_wait * 2).min(RECONNECT_MAX);
+                continue;
+            }
+            Err(OpenError::Connect(why)) => {
+                if !retrying {
+                    tracing::info!(pane = %shared.pane, host = host.name(), error = %why, "waiting for the host");
+                    notice(&format!("─── {why}; trying again ───"));
+                    retrying = true;
+                }
+                if !wait_unless_detached(link, wait) {
+                    return;
+                }
+                wait = (wait * 2).min(RECONNECT_MAX);
+                continue;
+            }
+        };
+        if let Some(text) = &opened.notice {
+            notice(text);
+        }
+        let _ = reader.set_read_timeout(Some(REMOTE_ANSWER_TIMEOUT));
+        let conn = match client::answer(Box::new(reader), Box::new(writer)) {
+            Ok(Connected::Attached(conn)) => conn,
+            Ok(Connected::Refused(refusal)) => {
+                tracing::warn!(pane = %shared.pane, ?refusal, "the terminal's helper refused");
+                notice(&format!("the terminal's helper refused to show it ({refusal:?})"));
+                shared.mark_exited(Some(run), None);
+                return;
+            }
+            // The connection broke, or is too slow for now: worth trying again.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                tracing::info!(pane = %shared.pane, error = %e, "no answer from the terminal's helper yet");
+                if !wait_unless_detached(link, wait) {
+                    return;
+                }
+                wait = (wait * 2).min(RECONNECT_MAX);
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(pane = %shared.pane, error = %e, "the terminal's helper did not answer");
+                notice(&format!("the terminal's helper on {} did not answer: {e}", host.name()));
+                shared.mark_exited(Some(run), None);
+                return;
+            }
+        };
+        wait = Duration::from_secs(2);
+        lost_wait = Duration::from_millis(200);
+        let Connection { welcome, reader, writer } = conn;
+        // What was typed while the connection was down goes out now, unless
+        // the program it was typed for is gone (the host restarted).
+        if !queue.recover(broke && opened.fresh) {
+            return;
+        }
+        let writing =
+            std::thread::Builder::new().name(format!("host-writer-{}", shared.pane)).spawn(move || queue.run(writer));
+        let Ok(writing) = writing else {
+            shared.mark_exited(Some(run), None);
+            return;
+        };
+        tracing::info!(pane = %shared.pane, host = host.name(), fresh = opened.fresh, "remote terminal connected");
+        if let Some(line) = opened.then_type.filter(|_| opened.fresh) {
+            type_soon(session, line);
+        }
+        if read_host(session, run, reader, link, welcome, opened.fresh) != HostEnd::Lost {
+            return;
+        }
+        // The program runs on there: shown again once connected. Should its
+        // helper be gone by then, it starts afresh as after a restart.
+        link.interrupt();
+        queue = match writing.join() {
+            Ok(Some(queue)) => queue,
+            _ => return,
+        };
+        tracing::warn!(pane = %shared.pane, host = host.name(), "lost the connection to the host");
+        notice(&format!("─── lost the connection to {}; reconnecting ───", host.name()));
+        retrying = true;
+        broke = true;
+        open.mode = OpenMode::ExistingOrNew;
+        open.start.resume = shared.resume.lock().unwrap().clone();
+        open.start.preload = TerminalHandle(session.clone())
+            .snapshot(preload_lines)
+            .filter(|d| !d.is_empty())
+            .map(|d| String::from_utf8_lossy(&d).into_owned());
+    }
+}
+
+/// Waits `wait`, unless the link lets go meanwhile. Returns whether it is still wanted.
+fn wait_unless_detached(link: &HostLink, wait: Duration) -> bool {
+    let until = Instant::now() + wait;
+    while Instant::now() < until {
+        if link.is_detached() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !link.is_detached()
+}
+
+/// How a terminal's connection to its helper ended.
+#[derive(Debug, PartialEq, Eq)]
+enum HostEnd {
+    /// The program ended, another client took the terminal, or this one let go.
+    Done,
+    /// The connection broke: a remote one may be made again.
+    Lost,
 }
 
 /// The helper shows the terminal here (again): a new screen, which the
@@ -1018,11 +1236,11 @@ fn take_welcome(session: &Arc<Session>, welcome: &Welcome) -> GridSize {
 fn read_host(
     session: &Arc<Session>,
     run: u64,
-    mut reader: FrameReader<TcpStream>,
+    mut reader: FrameReader<Box<dyn Duplex>>,
     link: &HostLink,
     welcome: Option<Welcome>,
     mut restored: bool,
-) {
+) -> HostEnd {
     let shared = &session.shared;
     let mut parser: Processor = Processor::new();
     let mut scanner = OscScanner::default();
@@ -1047,12 +1265,15 @@ fn read_host(
                 shared.wake();
                 continue;
             }
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted && !link.is_detached() => {
+                return HostEnd::Lost;
+            }
             end => {
                 if !link.is_detached() {
                     tracing::warn!(pane = %shared.pane, result = ?end.map(|_| ()), "lost the terminal's helper");
                     shared.mark_exited(Some(run), None);
                 }
-                return;
+                return HostEnd::Done;
             }
         };
         match frame.kind {
@@ -1092,11 +1313,11 @@ fn read_host(
             proto::EXITED => {
                 let code = proto::parse::<Exited>(&frame.payload).ok().and_then(|e| e.code);
                 shared.mark_exited(Some(run), code);
-                return;
+                return HostEnd::Done;
             }
             proto::KICKED => {
                 shared.shown_elsewhere(run, false);
-                return;
+                return HostEnd::Done;
             }
             _ => {}
         }

@@ -24,16 +24,32 @@ use ratatui::crossterm::cursor::{SetCursorStyle, Show};
 use ratatui::crossterm::{event, execute, terminal};
 use termroost_core::{Config, Core, CursorShape, Error};
 
-use crate::app::{App, Msg};
+use crate::app::{App, Msg, Open};
 
 const HELP: &str = "\
-Usage: terminalrooster-tui [FOLDER]
+Usage: terminalrooster-tui [FOLDER | HOST:FOLDER]
 
 Projects, sessions and coding agents, side by side, in this terminal.
-With FOLDER, opens its project (adding it if there is none).
+With FOLDER, opens its project (adding it if there is none). HOST:FOLDER
+is a folder of an SSH host, as scp takes it (droplet:~/app): the project's
+terminals run there.
 ";
 
+/// The argument that makes this program a terminal's helper (on a remote
+/// host it was copied to, see `termroost_core::remote`).
+const HOST_ARG: &str = "host";
+
 fn main() -> ExitCode {
+    match std::env::args().nth(1).as_deref() {
+        Some(termroost_core::remote::REMOTE_ARG) => {
+            logging::init_stderr();
+            let exe = termroost_core::remote::this_program().expect("this program");
+            let helper = termroost_core::HostCommand { program: exe, args: vec![HOST_ARG.to_owned()], env: Vec::new() };
+            std::process::exit(termroost_core::remote::serve(helper));
+        }
+        Some(HOST_ARG) => std::process::exit(termroost_core::host::serve()),
+        _ => {}
+    }
     let launch_dir = std::env::current_dir().unwrap_or_default();
     let mut open = None;
     for arg in std::env::args_os().skip(1) {
@@ -57,13 +73,15 @@ fn main() -> ExitCode {
             }
         }
     }
-    let open = match open.map(|p| launch_dir.join(p)) {
-        Some(dir) if !dir.is_dir() => {
+    let remote = open.as_ref().and_then(|p| folders::split_remote(&p.to_string_lossy()));
+    let open = match (open.map(|p| launch_dir.join(p)), remote) {
+        (Some(dir), _) if dir.is_dir() => Some(Open::Here(plain(dir.canonicalize().unwrap_or(dir)))),
+        (_, Some((host, path))) => Some(Open::Remote { host, path }),
+        (Some(dir), None) => {
             eprintln!("terminalrooster-tui: {} is not a folder", dir.display());
             return ExitCode::FAILURE;
         }
-        Some(dir) => Some(plain(dir.canonicalize().unwrap_or(dir))),
-        None => None,
+        (None, _) => None,
     };
 
     // Terminals started from here must not believe they run inside another
@@ -109,7 +127,7 @@ fn plain(path: PathBuf) -> PathBuf {
     }
 }
 
-fn run(core: Core, launch_dir: PathBuf, open: Option<PathBuf>) -> io::Result<()> {
+fn run(core: Core, launch_dir: PathBuf, open: Option<Open>) -> io::Result<()> {
     let screen = Screen::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
@@ -132,6 +150,7 @@ fn run(core: Core, launch_dir: PathBuf, open: Option<PathBuf>) -> io::Result<()>
         }
     })?;
     let events = core.events();
+    let msgs = tx.clone();
     std::thread::Builder::new().name("core-events".into()).spawn(move || {
         while let Ok(ev) = events.recv_blocking() {
             if tx.send(Msg::Core(ev)).is_err() {
@@ -140,7 +159,7 @@ fn run(core: Core, launch_dir: PathBuf, open: Option<PathBuf>) -> io::Result<()>
         }
     })?;
 
-    let mut app = App::new(core, launch_dir, open);
+    let mut app = App::new(core, launch_dir, open, msgs);
     let mut shape = None;
     loop {
         if app.dirty {

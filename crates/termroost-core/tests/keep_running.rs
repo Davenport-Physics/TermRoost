@@ -129,7 +129,12 @@ fn a_terminal_keeps_running_while_terminalrooster_is_closed() {
         let mut core = open(dir.path());
         core.dispatch(Command::SetDefaultShell(Some(slow_printer()))).unwrap();
         let Outcome::Project(project) = core
-            .dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None })
+            .dispatch(Command::CreateProject {
+                name: "p".into(),
+                working_dir: dir.path().into(),
+                shell: None,
+                host: None,
+            })
             .unwrap()
         else {
             panic!()
@@ -169,7 +174,8 @@ fn switching_keep_running_off_ends_the_helper() {
     let mut core = open(dir.path());
     let printer = if cfg!(windows) { "cmd /c \"echo hi & more\"" } else { "sh -c \"printf 'hi\\n'; exec cat\"" };
     core.dispatch(Command::SetDefaultShell(Some(printer.to_owned()))).unwrap();
-    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None }).unwrap();
+    core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None, host: None })
+        .unwrap();
     let pane = core.state().active_tab().unwrap().layout.first_pane();
     let local_pid = shell_pid(&mut core, pane);
     assert!(!conn_file(dir.path(), pane).exists(), "terminals run in TerminalRooster by default");

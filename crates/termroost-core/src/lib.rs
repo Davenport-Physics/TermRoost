@@ -19,11 +19,13 @@ pub mod codex_hook;
 pub mod command;
 pub mod detect;
 pub mod error;
+pub mod files;
 pub mod git;
 pub mod host;
 pub mod layout;
 pub mod model;
 pub mod paths;
+pub mod remote;
 pub mod session;
 pub mod store;
 
@@ -43,12 +45,15 @@ pub use error::{Error, Result};
 pub use host::HostCommand;
 pub use layout::{Axis, Layout};
 pub use model::*;
+pub use remote::{Machine, RemoteHost, RemoteStatus};
 pub use session::input::{Key, KeyInput, Modifiers, MouseButton, MouseEventKind, MouseInput, NamedKey};
 pub use session::render::{CellStyle, CursorInfo, CursorShape, Palette, RenderCell, RenderContent, Rgb};
 pub use session::{Activity, GridSize, SelectionKind, TerminalHandle};
 
 use paths::InstanceLock;
-use session::{Background, HostPlan, NewHost, SpawnSpec};
+use remote::client::Remotes;
+use remote::wire::{OpenMode, OpenTerminal, Request, Resume, StartSpec};
+use session::{Background, HostPlan, NewHost, RemotePlan, SpawnSpec};
 use store::{Store, StoreOp};
 
 /// The name of a group made by [`Command::GroupProjects`].
@@ -69,6 +74,8 @@ pub struct Config {
     /// TerminalRooster quits runs under (see [`host`]). Without one, such
     /// terminals run like the others.
     pub host: Option<HostCommand>,
+    /// How remote hosts are reached (over SSH, unless a test says otherwise).
+    pub remote: remote::Transport,
 }
 
 impl Default for Config {
@@ -79,6 +86,7 @@ impl Default for Config {
             autosave_interval: Duration::from_secs(5),
             agent_homes: AgentHomes::from_env(),
             host: None,
+            remote: remote::Transport::default(),
         }
     }
 }
@@ -132,6 +140,8 @@ pub struct Core {
     renamed: Renamed,
     /// Where the shell integration scripts are, if they could be written.
     integration: Option<PathBuf>,
+    /// The remote hosts projects are on, connected as needed.
+    remotes: Arc<Remotes>,
     _lock: InstanceLock,
 }
 
@@ -177,6 +187,12 @@ impl Core {
         }
 
         let (events_tx, events_rx) = async_channel::unbounded();
+        let remotes = Arc::new(Remotes::new(remote::client::Shared {
+            client: client_id(&data_dir),
+            transport: config.remote,
+            events: events_tx.clone(),
+            keep: Mutex::new(HashMap::new()),
+        }));
         let bg = Background {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             detector: Arc::new(Mutex::new(detect::Detector::new(config.agent_homes.clone()))),
@@ -209,8 +225,10 @@ impl Core {
             host: config.host,
             renamed,
             integration,
+            remotes,
             _lock: lock,
         };
+        core.refresh_remote_terminals();
         tracing::info!(
             data_dir = %core.data_dir.display(),
             projects = core.state.projects.len(),
@@ -232,6 +250,58 @@ impl Core {
 
     pub fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
+    }
+
+    /// The computer a folder of `host` is on: this one for `None`. A remote
+    /// one connects when first asked something (see [`Machine`]).
+    pub fn machine(&self, host: Option<&str>) -> Machine {
+        match host {
+            None => Machine::Local,
+            Some(h) => Machine::Remote(self.remotes.host(h)),
+        }
+    }
+
+    /// The computer a project's folder is on.
+    pub fn project_machine(&self, project: ProjectId) -> Machine {
+        self.machine(self.state.project(project).and_then(|p| p.host.as_deref()))
+    }
+
+    /// The computer a session's folder is on: its project's.
+    pub fn tab_machine(&self, tab: TabId) -> Machine {
+        self.state.tab(tab).map(|t| self.project_machine(t.project)).unwrap_or_default()
+    }
+
+    /// Where the connection to `host` stands.
+    pub fn remote_status(&self, host: &str) -> RemoteStatus {
+        self.remotes.host(host).status()
+    }
+
+    /// Drops the connection to `host`, if there is one. Its terminals run on
+    /// there and connect again by themselves, as after a broken connection.
+    pub fn reconnect(&self, host: &str) {
+        tracing::info!(host, "dropping the connection to a remote host");
+        self.remotes.host(host).disconnect();
+    }
+
+    /// The host of a pane's project, for a pane of a remote project.
+    fn remote_of(&self, pane: PaneId) -> Option<RemoteHost> {
+        let tab = self.state.tab(self.state.pane(pane)?.tab)?;
+        let host = self.state.project(tab.project)?.host.as_deref()?;
+        Some(self.remotes.host(host))
+    }
+
+    /// Tells each host which of its terminals there still are (see
+    /// [`remote::wire::ClientHello::keep`]).
+    fn refresh_remote_terminals(&self) {
+        let mut keep: HashMap<String, Vec<PaneId>> = HashMap::new();
+        for pane in self.state.panes.values() {
+            let host =
+                self.state.tab(pane.tab).and_then(|t| self.state.project(t.project)).and_then(|p| p.host.clone());
+            if let Some(host) = host {
+                keep.entry(host).or_default().push(pane.id);
+            }
+        }
+        self.remotes.set_keep(keep);
     }
 
     /// What this start carried over from TermRoost (usually nothing).
@@ -324,6 +394,21 @@ impl Core {
         if let Some(h) = self.terminal(pane) {
             h.set_agent(observed.map(|o| o.kind));
         }
+        self.sync_resume(pane);
+    }
+
+    /// What a pane types once its program starts again (see [`Core::resume_line`]),
+    /// for a remote host to work out.
+    fn remote_resume(&self, pane: PaneId) -> Resume {
+        let p = self.state.pane(pane);
+        Resume { agent: p.and_then(|p| p.agent.clone()), command: p.and_then(|p| p.resume_command.clone()) }
+    }
+
+    /// Tells a remote terminal what it types should it start anew there.
+    fn sync_resume(&self, pane: PaneId) {
+        if let Some(h) = self.terminal(pane).filter(|h| h.remote().is_some()) {
+            h.set_resume(self.remote_resume(pane));
+        }
     }
 
     /// The programs running in each terminal (below its shell), for asking
@@ -334,6 +419,12 @@ impl Core {
             self.bg.sessions.lock().unwrap().values().filter_map(|h| Some((h.pane(), h.shell_pid()?))).collect();
         let mut found: Vec<(PaneId, Vec<Program>)> =
             self.bg.detector.lock().unwrap().programs(&shells).into_iter().filter(|(_, n)| !n.is_empty()).collect();
+        // Remote ones as their host's last scan saw them.
+        let remote: Vec<TerminalHandle> =
+            self.bg.sessions.lock().unwrap().values().filter(|h| h.remote().is_some()).cloned().collect();
+        found.extend(
+            remote.iter().map(|h| (h.pane(), h.activity().programs)).filter(|(_, programs)| !programs.is_empty()),
+        );
         found.sort_by_key(|(p, _)| *p);
         found
     }
@@ -345,14 +436,23 @@ impl Core {
     /// stay, see [`LeftDir::busy`]. Wait with [`LeftDir::wait`] before
     /// deleting the directory: Windows cannot delete a folder that a process
     /// is still working in (other programs: [`detect::processes_in`]).
-    pub fn leave_dir(&mut self, dir: &std::path::Path) -> LeftDir {
+    /// `host`: the computer the directory is on (`None`: this one); only
+    /// that computer's sessions are in it.
+    pub fn leave_dir(&mut self, host: Option<&str>, dir: &std::path::Path) -> LeftDir {
         let s = &self.state;
-        let closed: Vec<TabId> =
-            s.tabs.iter().filter(|t| git::is_within(&s.tab_working_dir(t), dir)).map(|t| t.id).collect();
+        let on_host =
+            |tab: TabId| s.tab(tab).and_then(|t| s.project(t.project)).is_some_and(|p| p.host.as_deref() == host);
+        let closed: Vec<TabId> = s
+            .tabs
+            .iter()
+            .filter(|t| on_host(t.id) && git::is_within(&s.tab_working_dir(t), dir))
+            .map(|t| t.id)
+            .collect();
         let strays: Vec<PaneId> = s
             .panes
             .values()
-            .filter(|p| !closed.contains(&p.tab) && p.cwd.as_deref().is_some_and(|c| git::is_within(c, dir)))
+            .filter(|p| on_host(p.tab) && !closed.contains(&p.tab))
+            .filter(|p| p.cwd.as_deref().is_some_and(|c| git::is_within(c, dir)))
             .map(|p| p.id)
             .collect();
 
@@ -360,10 +460,19 @@ impl Core {
         let mut stopped: Vec<u32> =
             s.panes.values().filter(|p| closed.contains(&p.tab)).filter_map(|p| shell_of(&p.id)).collect();
         let running_strays: Vec<(PaneId, u32)> = strays.iter().filter_map(|p| Some((*p, shell_of(p)?))).collect();
-        let idle = detect::idle_shells(&running_strays);
+        let mut idle = detect::idle_shells(&running_strays);
+        let remote_strays: Vec<PaneId> = strays
+            .iter()
+            .copied()
+            .filter(|p| self.terminal(*p).is_some_and(|h| h.remote().is_some() && h.is_running()))
+            .collect();
+        idle.extend(
+            remote_strays.iter().copied().filter(|p| self.terminal(*p).is_some_and(|h| h.activity().is_idle())),
+        );
         let busy: Vec<PaneId> = running_strays
             .iter()
             .map(|(p, _)| *p)
+            .chain(remote_strays.iter().copied())
             .filter(|p| !idle.contains(p) || s.pane(*p).is_some_and(|p| p.agent.is_some()))
             .collect();
         stopped.extend(running_strays.iter().filter(|(p, _)| !busy.contains(p)).map(|(_, pid)| *pid));
@@ -387,7 +496,8 @@ impl Core {
             }
         }
         // And so does this process.
-        if let (Ok(cwd), Some(parent)) = (std::env::current_dir(), dir.parent())
+        if host.is_none()
+            && let (Ok(cwd), Some(parent)) = (std::env::current_dir(), dir.parent())
             && git::is_within(&cwd, dir)
             && let Err(e) = std::env::set_current_dir(parent)
         {
@@ -421,6 +531,7 @@ impl Core {
             tracing::debug!(error = %e, "command rejected");
         }
         self.store.write(ops);
+        self.refresh_remote_terminals();
         result
     }
 
@@ -433,8 +544,12 @@ impl Core {
     fn apply(&mut self, cmd: Command, ops: &mut Vec<StoreOp>) -> Result<Outcome> {
         use Command as C;
         match cmd {
-            C::CreateProject { name, working_dir, shell } => {
+            C::CreateProject { name, working_dir, shell, host } => {
                 let name = non_empty(&name, "project name")?;
+                let host = host.map(|h| h.trim().to_owned()).filter(|h| !h.is_empty());
+                if let Some(h) = &host {
+                    remote::check_host(h).map_err(Error::Invalid)?;
+                }
                 let id = ProjectId(self.alloc());
                 let sort_order = self.state.projects.iter().map(|p| p.sort_order + 1).max().unwrap_or(0);
                 let project = Project {
@@ -442,6 +557,7 @@ impl Core {
                     name,
                     working_dir,
                     shell: shell.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()),
+                    host,
                     sort_order,
                     active_tab: None,
                     group: None,
@@ -596,7 +712,11 @@ impl Core {
                     .collect();
                 let shells: Vec<(PaneId, u32)> =
                     running.iter().filter_map(|(p, h)| Some((*p, h.shell_pid()?))).collect();
-                let idle = detect::idle_shells(&shells);
+                let mut idle = detect::idle_shells(&shells);
+                // A remote one as its host's last scan saw it.
+                idle.extend(
+                    running.iter().filter(|(_, h)| h.remote().is_some() && h.activity().is_idle()).map(|(p, _)| *p),
+                );
                 let stay: HashSet<PaneId> = running
                     .iter()
                     .map(|(p, _)| *p)
@@ -749,6 +869,7 @@ impl Core {
                 let p = self.state.panes.get_mut(&pane).ok_or(Error::NotFound("pane"))?;
                 p.resume_command = command.map(|c| c.trim().to_owned()).filter(|c| !c.is_empty());
                 ops.push(StoreOp::UpsertPane(p.clone()));
+                self.sync_resume(pane);
                 Ok(Outcome::None)
             }
             C::StartAgent { pane, kind, args } => {
@@ -770,6 +891,7 @@ impl Core {
                 let p = self.state.panes.get_mut(&pane).expect("checked");
                 p.agent = Some(session);
                 ops.push(StoreOp::UpsertPane(p.clone()));
+                self.sync_resume(pane);
                 Ok(Outcome::None)
             }
             C::ClearAgent(pane) => {
@@ -779,6 +901,7 @@ impl Core {
                 if let Some(h) = self.terminal(pane) {
                     h.set_agent(None);
                 }
+                self.sync_resume(pane);
                 Ok(Outcome::None)
             }
             C::SetKeepRunning { pane, on } => {
@@ -789,7 +912,14 @@ impl Core {
                 p.keep_running = on;
                 ops.push(StoreOp::UpsertPane(p.clone()));
                 tracing::info!(%pane, on, "keep running changed");
-                if let Some(handle) = self.terminal(pane) {
+                if let Some(handle) = self.terminal(pane).filter(|h| h.remote().is_some()) {
+                    // It runs under a helper there either way; quitting ends it or not.
+                    handle.print_notice(if on {
+                        "─── keeps running when Terminal Rooster quits ───"
+                    } else {
+                        "─── stops when Terminal Rooster quits ───"
+                    });
+                } else if let Some(handle) = self.terminal(pane) {
                     // Shown elsewhere, the helper isn't this process's to end.
                     if handle.is_shown_elsewhere() {
                         self.end_helper(pane);
@@ -800,7 +930,7 @@ impl Core {
                         "─── stops when Terminal Rooster quits ───"
                     });
                     self.start_process(pane, &handle, true);
-                } else if !on {
+                } else if !on && self.remote_of(pane).is_none() {
                     // Its session isn't open: the helper from an earlier run.
                     self.end_helper(pane);
                 }
@@ -1105,6 +1235,18 @@ impl Core {
             handle.replay(&session::without_restore_banners(&data));
         }
         handle.set_agent(self.state.pane(pane).and_then(|p| p.agent.as_ref()).map(|a| a.kind));
+        if let Some(host) = self.remote_of(pane) {
+            // Before it is listed, so no scan takes its shell for one here.
+            handle.set_remote(host.clone());
+            self.bg.sessions.lock().unwrap().insert(pane, handle.clone());
+            // One that keeps running is shown as it is, if its helper runs on
+            // there. Others start anew, as here: one left running there (as
+            // Terminal Rooster quit or crashed without reaching the host) ends.
+            let keeps = self.state.pane(pane).is_some_and(|p| p.keep_running);
+            let mode = if restored && keeps { OpenMode::ExistingOrNew } else { OpenMode::New };
+            self.attach_remote(pane, &handle, host, mode, restored);
+            return handle;
+        }
         self.bg.sessions.lock().unwrap().insert(pane, handle.clone());
         // A helper that kept the terminal running while TerminalRooster was closed.
         let running = self
@@ -1118,6 +1260,37 @@ impl Core {
             None => self.start_process(pane, &handle, restored),
         }
         handle
+    }
+
+    /// Shows a remote pane's terminal: its program runs on the host, under
+    /// a helper found there (`mode`) or started. `resume`: a new one types
+    /// the pane's resume command, as in [`Core::start_process`].
+    fn attach_remote(&self, pane: PaneId, handle: &TerminalHandle, host: RemoteHost, mode: OpenMode, resume: bool) {
+        let Some(record) = self.state.pane(pane) else { return };
+        let Some(tab) = self.state.tab(record.tab) else { return };
+        let Some(project) = self.state.project(tab.project) else { return };
+        let mut env = base_env();
+        env.insert("TERMINALROOSTER_PANE_ID".to_owned(), pane.to_string());
+        env.insert("TERMINALROOSTER_PROJECT".to_owned(), project.name.clone());
+        let settings = &self.state.settings;
+        let preload = handle
+            .snapshot(settings.saved_scrollback_lines)
+            .filter(|d| !d.is_empty())
+            .map(|d| String::from_utf8_lossy(&d).into_owned());
+        let start = StartSpec {
+            shell: project.shell.clone(),
+            // Where the shell last was, else the session's folder.
+            cwd: record.cwd.iter().cloned().chain([self.state.tab_working_dir(tab)]).collect(),
+            env,
+            shell_integration: settings.shell_integration,
+            scrollback_lines: settings.scrollback_lines,
+            preload,
+            resume: if resume { self.remote_resume(pane) } else { Resume::default() },
+        };
+        tracing::info!(%pane, host = host.name(), ?mode, resume, "showing a remote terminal");
+        handle.set_resume(self.remote_resume(pane));
+        let open = OpenTerminal { pane, mode, size: handle.size(), start };
+        handle.attach_remote(RemotePlan { host, open, preload_lines: settings.saved_scrollback_lines });
     }
 
     /// Whether the pane's program runs under a helper of its own (see [`host`]).
@@ -1324,6 +1497,12 @@ impl Core {
     /// `resume`: types the pane's resume command (its agent's, say) once
     /// the shell runs.
     fn start_process(&mut self, pane: PaneId, handle: &TerminalHandle, resume: bool) {
+        if let Some(host) = handle.remote().cloned() {
+            // Ends the program there, then starts it anew.
+            handle.shutdown();
+            self.attach_remote(pane, handle, host, OpenMode::New, resume);
+            return;
+        }
         let Some(spec) = self.process_spec(pane, handle) else { return };
         let line = if resume { self.resume_line(pane) } else { None };
         if let Some(new) = self.new_host(pane, &spec, handle, line.clone()) {
@@ -1378,8 +1557,14 @@ impl Core {
         if let Some(h) = &handle {
             h.shutdown();
         }
-        // A helper this process doesn't show is ended through its file.
-        if handle.is_none_or(|h| h.is_shown_elsewhere()) {
+        let remote = handle.as_ref().and_then(|h| h.remote().cloned()).or_else(|| self.remote_of(pane));
+        if let Some(host) = remote {
+            // Also when it wasn't shown in this run: its helper there may run.
+            std::thread::spawn(move || {
+                let _ = host.call_if_up::<()>(Request::EndTerminals(vec![pane]), Duration::from_secs(10));
+            });
+        } else if handle.is_none_or(|h| h.is_shown_elsewhere()) {
+            // A helper this process doesn't show is ended through its file.
             self.end_helper(pane);
         }
         self.restored.remove(&pane);
@@ -1409,8 +1594,23 @@ impl Core {
         self.bg.save_dirty(true);
         self.store.flush();
         // Terminals under helpers run on; the next start shows them again.
+        // Remote ones run under helpers anyway: those that don't keep
+        // running end now.
+        let mut ending: HashMap<String, (RemoteHost, Vec<PaneId>)> = HashMap::new();
         for h in self.bg.sessions.lock().unwrap().drain().map(|(_, h)| h) {
-            h.detach();
+            match h.remote() {
+                Some(host) if !self.state.pane(h.pane()).is_some_and(|p| p.keep_running) => {
+                    h.shutdown();
+                    ending.entry(host.name().to_owned()).or_insert_with(|| (host.clone(), Vec::new())).1.push(h.pane());
+                }
+                _ => h.detach(),
+            }
+        }
+        for (host, panes) in ending.into_values() {
+            let _ = host.call_if_up::<()>(Request::EndTerminals(panes), Duration::from_secs(3));
+        }
+        for host in self.remotes.all() {
+            host.disconnect();
         }
         for (_, h) in self.scratch.drain() {
             h.shutdown();
@@ -1436,6 +1636,22 @@ impl Drop for Core {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Identifies this Terminal Rooster to remote hosts (see
+/// [`remote::wire::ClientHello::client`]): made once, kept in the data directory.
+fn client_id(data_dir: &std::path::Path) -> String {
+    let file = data_dir.join("remote-client-id");
+    if let Ok(id) = std::fs::read_to_string(&file)
+        && !id.trim().is_empty()
+    {
+        return id.trim().to_owned();
+    }
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    if let Err(e) = std::fs::write(&file, &id) {
+        tracing::warn!(error = %e, "could not save this computer's id for remote hosts");
+    }
+    id
 }
 
 /// Environment every terminal gets.

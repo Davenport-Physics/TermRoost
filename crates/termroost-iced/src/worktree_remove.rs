@@ -9,7 +9,7 @@ use iced::widget::{column, container, row, text};
 use iced::{Alignment, Element, Length, Task};
 use termroost_core::TabId;
 use termroost_core::detect::{self, FolderProcess};
-use termroost_core::git::{self, Head, Repo};
+use termroost_core::git::{self, Head};
 
 use crate::app::{App, Dialog, Message, RunningTerminal};
 use crate::dialogs::DialogParts;
@@ -140,6 +140,13 @@ impl App {
         Task::none()
     }
 
+    fn remove_form_ref(&self) -> Option<&RemoveForm> {
+        match &self.dialog {
+            Some(Dialog::RemoveWorktree(f)) => Some(f),
+            _ => None,
+        }
+    }
+
     pub(crate) fn remove_form(&mut self) -> Option<&mut RemoveForm> {
         match &mut self.dialog {
             Some(Dialog::RemoveWorktree(f)) => Some(f),
@@ -151,10 +158,22 @@ impl App {
     fn ask_remove(&mut self, path: PathBuf) -> Task<Message> {
         let Some(Dialog::Worktree(back)) = self.dialog.take() else { return Task::none() };
         let s = self.core.state();
-        let sessions: Vec<TabId> =
-            s.tabs.iter().filter(|t| git::is_within(&s.tab_working_dir(t), &path)).map(|t| t.id).collect();
-        let in_folder =
-            |pane| s.pane(pane).and_then(|p| p.cwd.as_deref()).is_some_and(|cwd| git::is_within(cwd, &path));
+        let host = back.repo.machine.host();
+        // Sessions of the computer the worktree is on.
+        let here =
+            |tab: TabId| s.tab(tab).and_then(|t| s.project(t.project)).is_some_and(|p| p.host.as_deref() == host);
+        let sessions: Vec<TabId> = s
+            .tabs
+            .iter()
+            .filter(|t| here(t.id) && git::is_within(&s.tab_working_dir(t), &path))
+            .map(|t| t.id)
+            .collect();
+        let in_folder = |pane| {
+            s.pane(pane)
+                .filter(|p| here(p.tab))
+                .and_then(|p| p.cwd.as_deref())
+                .is_some_and(|cwd| git::is_within(cwd, &path))
+        };
         let (running, blocking) = self
             .running_terminals()
             .into_iter()
@@ -184,8 +203,9 @@ impl App {
         })));
         let (tx, rx) = async_channel::bounded(1);
         let dir = path.clone();
+        let repo = self.remove_form().map(|f| f.back.repo.clone());
         std::thread::spawn(move || {
-            let _ = tx.send_blocking(Repo::changes(&dir));
+            let _ = tx.send_blocking(repo.ok_or_else(|| "no repository".to_owned()).and_then(|r| r.changes(&dir)));
         });
         let others = self.look_for_others(path.clone());
         let changes = Task::perform(async move { rx.recv().await.unwrap_or_else(|e| Err(e.to_string())) }, move |c| {
@@ -196,6 +216,11 @@ impl App {
 
     /// Looks for programs working in the folder other than the terminals'.
     fn look_for_others(&self, path: PathBuf) -> Task<Message> {
+        // Only Windows keeps a folder that programs work in from being
+        // deleted, and remote hosts don't run it.
+        if self.remove_form_ref().is_some_and(|f| f.back.repo.machine.is_remote()) {
+            return Task::done(msg(RemoveMsg::Others(path, Vec::new())));
+        }
         let shells = self.core.shell_pids();
         let (tx, rx) = async_channel::bounded(1);
         let dir = path.clone();
@@ -224,7 +249,7 @@ impl App {
         let Some(f) = self.remove_form().filter(|f| f.can_remove()) else { return Task::none() };
         let (path, force, was_leftover, repo) = (f.path.clone(), f.discard, f.leftover, f.back.repo.clone());
         let others = if f.end_others { f.others.clone().unwrap_or_default() } else { Vec::new() };
-        let mut left = self.core.leave_dir(&path);
+        let mut left = self.core.leave_dir(repo.machine.host(), &path);
         for tab in &left.closed {
             self.grids.remove(tab);
             self.activity.remove(tab);
@@ -244,7 +269,8 @@ impl App {
             }
             let result =
                 if was_leftover { repo.remove_leftover(&target) } else { repo.remove_worktree(&target, force) };
-            let leftover = result.is_err() && target.exists() && repo.has_worktree(&target) == Ok(false);
+            let exists = || repo.machine.are_dirs(std::slice::from_ref(&target)).is_some_and(|d| d == [true]);
+            let leftover = result.is_err() && exists() && repo.has_worktree(&target) == Ok(false);
             let _ = tx.send_blocking((result, leftover));
         });
         let removed = Task::perform(

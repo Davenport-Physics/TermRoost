@@ -212,6 +212,11 @@ fn tone_text(t: &Theme, tone: Tone) -> Color {
     if tone == Tone::Neutral { c } else { mix(c, ink(t), by_tone(t, 0.25, 0.15)) }
 }
 
+/// Text in a tone's color (see [`tone_text`]).
+pub fn toned(tone: Tone) -> impl Fn(&Theme) -> iced::widget::text::Style {
+    move |t| iced::widget::text::Style { color: Some(tone_text(t, tone)) }
+}
+
 // Buttons
 
 fn button_style(background: Option<Color>, text_color: Color, radius: f32) -> button::Style {

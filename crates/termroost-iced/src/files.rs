@@ -17,10 +17,18 @@
 //! excludes file) is dimmed, along with everything inside it.
 //!
 //! Each entry has an icon for its kind of file (see [`file_icons`]).
+//!
+//! A remote project's folders are read on its host (see [`Machine`]), and
+//! read again every few seconds rather than watched.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use termroost_core::Machine;
+use termroost_core::files::new_file_path;
+#[cfg(test)]
+use termroost_core::files::{create_file, list_dir};
 
 use iced::widget::{button, column, container, mouse_area, operation, row, space, text};
 use iced::{Alignment, Element, Length, Task};
@@ -32,7 +40,7 @@ use crate::folder_watch::{self, Changes, FolderWatch};
 use crate::icons::{Icon, icon};
 use crate::reveal;
 use crate::side_panel::SideTab;
-use crate::sidebar::{muted_text, short_dir};
+use crate::sidebar::{muted_text, place_label};
 use crate::theme::{self, Tone};
 use crate::ui::{self, icon_button};
 
@@ -49,15 +57,7 @@ const GAP: f32 = 4.0;
 /// How often the folders shown are read again when they can't be watched.
 pub const POLL: Duration = Duration::from_secs(3);
 
-/// One file or folder in a listing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Entry {
-    pub path: PathBuf,
-    pub name: String,
-    pub is_dir: bool,
-    /// Git's ignore rules leave it out.
-    pub ignored: bool,
-}
+pub use termroost_core::files::Entry;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Listing {
@@ -67,6 +67,10 @@ pub enum Listing {
 
 #[derive(Debug, Default)]
 pub struct FilesState {
+    /// The host the folders below are on (`None`: this computer). When the
+    /// session shown is on another, they are forgotten: the same path can
+    /// be a different folder there.
+    host: Option<String>,
     /// Folders shown open, by full path. The root is always open.
     expanded: HashSet<PathBuf>,
     /// What was read of each folder.
@@ -101,8 +105,11 @@ pub enum FilesMsg {
     Toggle(PathBuf),
     /// Open a file in place of the terminals.
     Open(PathBuf),
-    /// Folders were read.
-    Listed(Vec<(PathBuf, Result<Vec<Entry>, String>)>),
+    /// Folders of `host` (`None`: this computer) were read.
+    Listed {
+        host: Option<String>,
+        listed: Vec<(PathBuf, Result<Vec<Entry>, String>)>,
+    },
     /// Something changed in the folders watched.
     Changed(Changes),
     /// Time to read the folders shown again (they can't all be watched).
@@ -133,70 +140,6 @@ pub enum FilesMsg {
 
 /// The name field of a new file.
 const NEW_FILE_INPUT: &str = "new-file-input";
-
-/// Where a file named `name` goes in `dir`. The name may go through folders
-/// (`docs/notes.md`), but not out of `dir`.
-pub fn new_file_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
-    let name = name.trim();
-    let plain = Path::new(name).components().all(|c| matches!(c, Component::Normal(_)));
-    if name.is_empty() || !plain || name.ends_with(std::path::is_separator) {
-        return Err("Not a file name".into());
-    }
-    Ok(dir.join(name))
-}
-
-/// Creates an empty file at `path`, and the folders it goes in. A file
-/// already there is left alone.
-pub fn create_file(path: &Path) -> Result<(), String> {
-    let exists = || format!("{} already exists", path.file_name().unwrap_or_default().to_string_lossy());
-    // Checked first: on Windows, a folder in the way is "access denied".
-    if path.symlink_metadata().is_ok() {
-        return Err(exists());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(exists()),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-/// The files and folders in `dir`: folders first, then by name ignoring case.
-/// `.git` (a folder, or a file in a linked worktree) is left out.
-pub fn list_dir(dir: &Path) -> Result<Vec<Entry>, String> {
-    let read = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
-    // What a walk that follows git's rules (as git does: only inside a
-    // repository) still lists; the rest is ignored. Hidden files count too.
-    let kept: HashSet<PathBuf> = ignore::WalkBuilder::new(dir)
-        .max_depth(Some(1))
-        .hidden(false)
-        .ignore(false)
-        .parents(true)
-        .build()
-        .filter_map(Result::ok)
-        .filter(|e| e.depth() == 1)
-        .map(ignore::DirEntry::into_path)
-        .collect();
-    let mut entries: Vec<Entry> = read
-        .filter_map(Result::ok)
-        .filter(|e| e.file_name() != ".git")
-        .map(|e| {
-            let path = e.path();
-            // The listing knows the type for free; only links need a look at their target.
-            let is_dir = match e.file_type() {
-                Ok(t) if t.is_symlink() => path.is_dir(),
-                Ok(t) => t.is_dir(),
-                Err(_) => false,
-            };
-            let ignored = !kept.contains(&path);
-            Entry { name: e.file_name().to_string_lossy().into_owned(), path, is_dir, ignored }
-        })
-        .collect();
-    entries.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase(), e.name.clone()));
-    Ok(entries)
-}
 
 /// A line of the tree as shown.
 #[derive(Debug, PartialEq, Eq)]
@@ -294,6 +237,24 @@ impl App {
         }
     }
 
+    /// The computer the Files tab's folder is on.
+    pub(crate) fn files_machine(&self) -> Machine {
+        let s = self.core.state();
+        match s.active_tab() {
+            Some(tab) => self.core.tab_machine(tab.id),
+            None => s.selected_project.map(|p| self.core.project_machine(p)).unwrap_or_default(),
+        }
+    }
+
+    /// Forgets what was read when the folder shown is on another computer now.
+    fn check_files_host(&mut self, machine: &Machine) {
+        let host = machine.host().map(str::to_owned);
+        if self.files.host != host {
+            let watch = std::mem::take(&mut self.files.watch);
+            self.files = FilesState { host, watch, ..FilesState::default() };
+        }
+    }
+
     /// The Files tab is on screen.
     pub(crate) fn files_shown(&self) -> bool {
         self.prefs.panel_open && self.prefs.side_tab == SideTab::Files && self.settings.is_none()
@@ -306,6 +267,7 @@ impl App {
             return None;
         }
         let root = self.files_root()?;
+        self.check_files_host(&self.files_machine());
         if self.files.listings.contains_key(&root) || self.files.reading.contains(&root) {
             return None;
         }
@@ -330,6 +292,10 @@ impl App {
     /// Watches what the Files tab shows, or nothing when it is not on screen.
     pub(crate) fn watch_files(&mut self) {
         let wanted = match self.files_root().filter(|_| self.files_shown()) {
+            Some(root) if self.files_machine().is_remote() => {
+                self.files.watch.poll_only(shown_dirs(&root, &self.files).into_iter().collect());
+                return;
+            }
             Some(root) if folder_watch::WHOLE_TREE => HashSet::from([root]),
             Some(root) => shown_dirs(&root, &self.files).into_iter().collect(),
             None => HashSet::new(),
@@ -340,6 +306,8 @@ impl App {
     /// Reads folders on a thread. Those being read already are read again
     /// once that's done, as they may have changed since it started.
     fn read_dirs(&mut self, dirs: Vec<PathBuf>) -> Task<Message> {
+        let machine = self.files_machine();
+        self.check_files_host(&machine);
         // Watched before they're read, so no change falls in between.
         self.watch_files();
         let (dirs, busy): (Vec<PathBuf>, Vec<PathBuf>) =
@@ -349,14 +317,13 @@ impl App {
             return Task::none();
         }
         let (tx, rx) = async_channel::bounded(1);
+        let host = machine.host().map(str::to_owned);
         std::thread::spawn(move || {
-            let listed = dirs.into_iter().map(|d| {
-                let listing = list_dir(&d);
-                (d, listing)
-            });
-            let _ = tx.send_blocking(listed.collect());
+            let _ = tx.send_blocking(machine.list_dirs(dirs));
         });
-        Task::perform(async move { rx.recv().await.unwrap_or_default() }, |l| Message::Files(FilesMsg::Listed(l)))
+        Task::perform(async move { rx.recv().await.unwrap_or_default() }, move |listed| {
+            Message::Files(FilesMsg::Listed { host: host.clone(), listed })
+        })
     }
 
     pub(crate) fn update_files(&mut self, msg: FilesMsg) -> Task<Message> {
@@ -374,7 +341,11 @@ impl App {
                 // The click took the keyboard from the terminal.
                 Task::batch([read, self.focus_active()])
             }
-            FilesMsg::Listed(listed) => {
+            FilesMsg::Listed { host, listed } => {
+                // Read before the session shown moved to another computer.
+                if host != self.files.host {
+                    return Task::none();
+                }
                 let mut next = Vec::new();
                 for (dir, result) in listed {
                     self.files.reading.remove(&dir);
@@ -455,11 +426,12 @@ impl App {
                 };
                 new.creating = true;
                 let dir = new.dir.clone();
-                // On a thread: the folder may be on a slow network drive.
+                // On a thread: the folder may be on a slow network drive, or another computer.
                 let (tx, rx) = async_channel::bounded(1);
                 let target = path.clone();
+                let machine = self.files_machine();
                 std::thread::spawn(move || {
-                    let _ = tx.send_blocking(create_file(&target));
+                    let _ = tx.send_blocking(machine.create_file(&target));
                 });
                 Task::perform(
                     async move {
@@ -497,11 +469,14 @@ impl App {
     pub(crate) fn view_files(&self) -> Element<'_, Message> {
         let Some(root) = self.files_root() else { return space::horizontal().width(0).into() };
         let hues = Hues::of(&self.active_theme());
-        let lines = rows(&root, &self.files).into_iter().map(|r| file_row(r, hues));
-        let path = mouse_area(muted_text(short_dir(&root, 40)).wrapping(text::Wrapping::None).width(Length::Fill))
+        let machine = self.files_machine();
+        let remote = machine.is_remote();
+        let lines = rows(&root, &self.files).into_iter().map(|r| file_row(r, hues, remote));
+        let label = place_label(&machine, &root, 40);
+        let path = mouse_area(muted_text(label).wrapping(text::Wrapping::None).width(Length::Fill))
             .on_right_press(Message::Files(FilesMsg::Menu(root.clone())));
         // The folder's own menu, under its name.
-        let menu = (self.files.menu.as_ref() == Some(&root)).then(|| file_menu(root.clone(), true));
+        let menu = (self.files.menu.as_ref() == Some(&root)).then(|| file_menu(root.clone(), true, remote));
         let path = context_menu(path, menu, Message::Files(FilesMsg::CloseMenu));
         let top = row![path, icon_button(Icon::Plus, Message::Files(FilesMsg::NewFile(root.clone())), "New file")]
             .align_y(Alignment::Center);
@@ -509,7 +484,8 @@ impl App {
     }
 }
 
-fn file_row(r: Row<'_>, hues: Hues) -> Element<'_, Message> {
+/// `remote`: the folders are on a remote host, which no file manager here shows.
+fn file_row(r: Row<'_>, hues: Hues, remote: bool) -> Element<'_, Message> {
     match r {
         Row::Entry { entry, depth, open, dim, menu } => {
             let chevron: Element<'_, Message> = match (entry.is_dir, open) {
@@ -535,7 +511,7 @@ fn file_row(r: Row<'_>, hues: Hues) -> Element<'_, Message> {
                 .style(theme::row_button)
                 .on_press(Message::Files(press));
             let line = mouse_area(line).on_right_press(Message::Files(FilesMsg::Menu(entry.path.clone())));
-            let menu = menu.then(|| file_menu(entry.path.clone(), entry.is_dir));
+            let menu = menu.then(|| file_menu(entry.path.clone(), entry.is_dir, remote));
             // Lined up with the entry's icon, past the line's padding.
             context_menu(line, menu, Message::Files(FilesMsg::CloseMenu))
                 .indent(6.0 + depth as f32 * INDENT + CHEVRON + GAP)
@@ -575,8 +551,8 @@ fn file_row(r: Row<'_>, hues: Hues) -> Element<'_, Message> {
 }
 
 /// The menu of an entry: a new file in it (or next to it), or showing it in
-/// the system's file manager.
-fn file_menu<'a>(path: PathBuf, is_dir: bool) -> Element<'a, Message> {
+/// the system's file manager (not for a remote host's: `remote`).
+fn file_menu<'a>(path: PathBuf, is_dir: bool, remote: bool) -> Element<'a, Message> {
     let item = |label: &'static str, msg: FilesMsg| {
         button(text(label).size(13))
             .width(Length::Fill)
@@ -585,10 +561,10 @@ fn file_menu<'a>(path: PathBuf, is_dir: bool) -> Element<'a, Message> {
             .on_press(Message::Files(msg))
     };
     let dir = if is_dir { path.clone() } else { path.parent().map_or_else(|| path.clone(), Path::to_path_buf) };
-    let items = column![
-        item("New file", FilesMsg::NewFile(dir)),
-        item(reveal::label(is_dir), FilesMsg::Reveal { path, is_dir }),
-    ];
+    let mut items = column![item("New file", FilesMsg::NewFile(dir))];
+    if !remote {
+        items = items.push(item(reveal::label(is_dir), FilesMsg::Reveal { path, is_dir }));
+    }
     container(items).padding(4).width(220).style(theme::menu).into()
 }
 

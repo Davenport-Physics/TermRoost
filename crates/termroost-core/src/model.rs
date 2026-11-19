@@ -59,6 +59,11 @@ pub struct Project {
     pub working_dir: PathBuf,
     /// Shell command line override for this project (e.g. `pwsh -NoLogo`).
     pub shell: Option<String>,
+    /// The SSH host the project's folder is on (as `ssh` takes it:
+    /// `droplet`, `me@example.com`); `None` on this computer. Its terminals,
+    /// files and git are there (see [`crate::remote`]).
+    #[serde(default)]
+    pub host: Option<String>,
     pub sort_order: i64,
     /// The tab shown when this project is selected.
     pub active_tab: Option<TabId>,

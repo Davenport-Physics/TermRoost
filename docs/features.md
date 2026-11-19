@@ -4,7 +4,7 @@ Everything is saved in SQLite as it changes: projects, sessions, split layouts, 
 
 ## Projects and sessions
 
-- **Projects** on the left, each with a working directory. Hover over a project for a button that copies its path.
+- **Projects** on the left, each with a working directory: on this computer, or on another one you reach with SSH (see [Projects on other computers](remote.md)). Hover over a project for a button that copies its path.
 - **Sessions** per project: vertical, renamable (double-click). Each session holds terminals in horizontal/vertical **splits**.
 - **Search** (Ctrl+Shift+P) above the projects list shows only the projects whose name or folder contains each word you type, ignoring case. **Enter** opens the first one and brings the whole list back; **Escape** empties the search and goes back to the terminal, **✕** just empties it. While you search, the next/previous project shortcuts go through the projects shown, and moving a project (by dragging or with the shortcuts) moves it among them.
 - **Reordering:** drag a project or session up or down its list; a line shows where it will land. Dropping it outside the list cancels. The [move shortcuts](shortcuts.md) do the same from the keyboard.

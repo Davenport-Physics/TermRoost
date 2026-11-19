@@ -13,6 +13,7 @@ A project-based terminal manager for running coding agents (Claude Code, Codex, 
 - **Notifications** when an agent finishes or needs you, or a command fails, in a terminal you aren't looking at.
 - **A side panel** for the session's files (with an editor, or Neovim), tasks, notes and git: the log, staging, commits and worktrees.
 - **Themes:** light and dark, following the system, or your own.
+- **Projects on other computers:** a project can be on a server you reach with SSH. Its terminals, agents, files and git run there, and its terminals keep running when the connection drops.
 - **In a terminal too:** `terminalrooster-tui` shows the same projects inside a terminal you already have open, over SSH too.
 
 ## Running
@@ -32,6 +33,7 @@ See [Installing and running](docs/installing.md) for what a build needs, bash on
 - [Installing and running](docs/installing.md): building, bash on Windows, data and logs
 - [Features](docs/features.md): projects, sessions, files and the editor, tasks, notes, git
 - [Restoring](docs/restoring.md): what comes back after a restart, terminals that keep running, exact agent sessions
+- [Projects on other computers](docs/remote.md): over SSH
 - [Notifications](docs/notifications.md): what notifies, how agents are detected, shell integration
 - [Themes](docs/themes.md)
 - [Keyboard shortcuts](docs/shortcuts.md)

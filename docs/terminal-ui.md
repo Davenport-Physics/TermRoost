@@ -3,10 +3,10 @@
 `terminalrooster-tui` is Terminal Rooster inside a terminal you already have open, over SSH too. It works on the same projects, sessions and data as the window, so only one of the two runs at a time.
 
 ```sh
-cargo run --release -p termroost-tui            # or: terminalrooster-tui [FOLDER]
+cargo run --release -p termroost-tui            # or: terminalrooster-tui [FOLDER | HOST:FOLDER]
 ```
 
-With a folder, it opens that folder's project, adding the project if there is none. The first start offers the current folder.
+With a folder, it opens that folder's project, adding the project if there is none. The first start offers the current folder. A folder of another computer is typed as `scp` takes it, `droplet:~/app`, there and in **p** (Tab completes its folder names once connected): see [Projects on other computers](remote.md).
 
 The list of projects and their sessions is on the left; the session you pick shows on the right. **Alt+Arrows** move between them from anywhere: left from the leftmost terminal reaches the list, and up or down past the edge goes to the previous or next session. Terminals get every other key.
 

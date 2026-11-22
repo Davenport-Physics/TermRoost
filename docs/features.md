@@ -21,6 +21,12 @@ A file opened from the Files tab can be edited where it is shown. **Ctrl+S** sav
 
 **Files that change on disk** (say, an agent edits one you have open) are noticed within a few seconds, and when you come back to the window. Without unsaved changes, the file just shows the new text (undo brings back the old). With unsaved changes, a bar under the text offers **Reload** or **Keep mine**; a deleted file offers to be saved again. Saving over a file that changed since you opened it asks first.
 
+### Pictures
+
+PNG, JPEG, GIF, WebP, BMP, ICO, TIFF, TGA, QOI and PNM pictures, and SVGs, open in a viewer instead of the editor (also when files open in Neovim). A picture starts fit to the space, never enlarged (an SVG is drawn as large as fits). The **wheel** zooms where the pointer is, stopping at 100% and at the fit on the way; **drag** to move a zoomed picture; a **double click** zooms in, or back to the fit. **Fit** and **100%** under the picture do the same. A checkerboard shows through transparent parts, and pixels show as squares when enlarged. A picture that changes on disk is shown again at the same zoom. A GIF shows its first frame; pictures larger than 64 MB don't open.
+
+An SVG can be edited: **Edit as text** under it opens its text (in Neovim, if files open there), and **Show picture** under the saved text shows it again.
+
 ### Neovim
 
 In **Settings → Editor**, *Edit files with: Neovim or Vim* opens files in Neovim (or Vim, if there is no Neovim) running in a terminal in the same place, with your own configuration. Quitting it (`:q`) closes the file. Neovim hears when you look at it and when you look away, so with `autoread` it picks up changes agents make. A different editor command can be set there; the file's path is added at the end. Ctrl+Shift shortcuts and Alt+arrows stay with Terminal Rooster.
@@ -60,4 +66,4 @@ Commits that are on no remote yet are marked **not pushed**, and a line says how
 
 Click a commit in the log to see what it changed, in place of the terminals: its message, author, date and id, then each file it changed with its hunks.
 
-**Uncommitted changes** at the top of the log opens what isn't committed yet, as git sees it: merge conflicts, unstaged changes, untracked files and staged changes. Stage or unstage a whole file, a hunk, or chosen lines of a hunk (click or drag over them, Shift for a range, Ctrl to add or take out one). Then write the message above the changes and **Commit** (or Ctrl+Enter). **Amend last commit** puts the last commit's message in the box, and the button then amends.
+**Uncommitted changes** at the top of the log opens what isn't committed yet, as git sees it: merge conflicts, staged changes, unstaged changes and untracked files. Staged files start folded, so they read as a list of what the next commit takes, right under its message. Click a file's or a section's title to fold or unfold it; **Collapse all** folds every file (those that change later too) and **Expand all** unfolds them. Stage or unstage a whole file, a hunk, or chosen lines of a hunk (click or drag over them, Shift for a range, Ctrl to add or take out one). Then write the message above the changes and **Commit** (or Ctrl+Enter). **Amend last commit** puts the last commit's message in the box, and the button then amends.

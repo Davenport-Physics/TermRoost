@@ -1,12 +1,15 @@
 //! Files opened from the Files tab. Each session has its own open files, and
 //! one of them can be shown in place of the session's terminals. A commit
-//! picked in the Git tab opens among them too (see `git_view`).
+//! picked in the Git tab opens among them too (see `git_view`). Pictures
+//! open in a viewer instead of the editor; an SVG can be switched between
+//! the two.
 
 mod disk;
 mod external;
 mod highlight;
 pub(crate) mod history;
 mod keys;
+pub(crate) mod picture;
 mod saved;
 mod text;
 mod view;
@@ -25,6 +28,7 @@ use crate::app::{App, Dialog, Message, RunningTerminal};
 use crate::git_view::{ChangesDoc, CommitDoc};
 use disk::{FileText, OnDisk, Reaction, SaveError, Stamp};
 use history::{History, Snapshot};
+use picture::{FilePicture, PictureDoc, Zoom};
 pub use text::{Format, Indent};
 
 /// What files open in.
@@ -87,11 +91,9 @@ pub enum DocKind {
     /// Being read.
     Loading,
     Text(Box<TextDoc>),
+    Picture(Box<PictureDoc>),
     /// Open before a restart, not read (or its editor not started) yet.
-    Restored {
-        /// It was open in a terminal editor.
-        terminal: bool,
-    },
+    Restored(OpenAs),
     /// A terminal editor (Neovim, Vim) has it open.
     Terminal {
         handle: TerminalHandle,
@@ -103,6 +105,16 @@ pub enum DocKind {
     Commit(Box<CommitDoc>),
     /// The uncommitted changes of the repository at `path`.
     Changes(Box<ChangesDoc>),
+}
+
+/// What a file was shown in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenAs {
+    /// The built-in editor.
+    Text,
+    /// Neovim or Vim (or the editor command set).
+    Terminal,
+    Picture,
 }
 
 /// A text file in the built-in editor.
@@ -207,13 +219,32 @@ pub enum EditorMsg {
     Reloaded(DocId, Result<FileText, String>),
     /// Keep the changes here over what changed on disk (until saved).
     KeepMine(DocId),
+    /// A picture was read (or can't be shown, and why).
+    PictureLoaded(DocId, Result<FilePicture, String>),
+    /// A picture that changed on disk was read again.
+    PictureReloaded(DocId, Result<FilePicture, String>),
+    /// A picture was zoomed or moved.
+    Zoom(DocId, Zoom),
+    /// Show an SVG's text instead of its picture.
+    AsText(DocId),
+    /// Show an SVG's picture instead of its text.
+    AsPicture(DocId),
 }
 
 impl EditorMsg {
     /// Whether the message may be logged: some carry what is in a file or
-    /// what the user types.
+    /// what the user types. Zooming isn't, as it comes with every move of
+    /// the pointer while a picture is dragged.
     pub fn loggable(&self) -> bool {
-        !matches!(self, EditorMsg::Loaded(..) | EditorMsg::Action(..) | EditorMsg::Reloaded(..))
+        !matches!(
+            self,
+            EditorMsg::Loaded(..)
+                | EditorMsg::Action(..)
+                | EditorMsg::Reloaded(..)
+                | EditorMsg::PictureLoaded(..)
+                | EditorMsg::PictureReloaded(..)
+                | EditorMsg::Zoom(..)
+        )
     }
 }
 
@@ -295,15 +326,15 @@ impl App {
     /// of showing a file misses it.
     pub(crate) fn revive_shown(&mut self) -> Task<Message> {
         let Some(tab) = self.active_tab_id() else { return Task::none() };
-        let Some(&OpenFile { id, ref path, kind: DocKind::Restored { terminal } }) = self.shown_doc() else {
+        let Some(&OpenFile { id, ref path, kind: DocKind::Restored(how) }) = self.shown_doc() else {
             return Task::none();
         };
         let path = path.clone();
-        if !terminal {
+        if how != OpenAs::Terminal {
             if let Some(doc) = self.doc_mut(id) {
                 doc.kind = DocKind::Loading;
             }
-            return self.read_doc(id, path);
+            return if how == OpenAs::Picture { self.read_picture(id, path) } else { self.read_doc(id, path) };
         }
         match self.launch_editor(tab, &path) {
             Some(kind) => {
@@ -328,10 +359,18 @@ impl App {
         match &mut self.doc_mut(id)?.kind {
             DocKind::Text(t) => Some(t),
             DocKind::Loading
-            | DocKind::Restored { .. }
+            | DocKind::Picture(_)
+            | DocKind::Restored(_)
             | DocKind::Terminal { .. }
             | DocKind::Commit(_)
             | DocKind::Changes(_) => None,
+        }
+    }
+
+    fn picture_mut(&mut self, id: DocId) -> Option<&mut PictureDoc> {
+        match &mut self.doc_mut(id)?.kind {
+            DocKind::Picture(p) => Some(p),
+            _ => None,
         }
     }
 
@@ -436,7 +475,11 @@ impl App {
         Some(match &self.shown_doc()?.kind {
             DocKind::Text(_) => operation::focus(FILE_EDITOR),
             DocKind::Terminal { handle, .. } => operation::focus(crate::terminal_view::widget_id(handle.pane())),
-            DocKind::Loading | DocKind::Restored { .. } | DocKind::Commit(_) | DocKind::Changes(_) => Task::none(),
+            DocKind::Loading
+            | DocKind::Picture(_)
+            | DocKind::Restored(_)
+            | DocKind::Commit(_)
+            | DocKind::Changes(_) => Task::none(),
         })
     }
 
@@ -454,7 +497,9 @@ impl App {
             return self.focus_active();
         }
         let id = self.new_doc_id();
-        if self.prefs.file_editor == FileEditor::Terminal {
+        // Pictures open in the viewer, whichever editor files open in.
+        let picture = picture::kind_of(&path).is_some();
+        if self.prefs.file_editor == FileEditor::Terminal && !picture {
             let Some(kind) = self.launch_editor(tab, &path) else { return Task::none() };
             let files = self.editors.entry(tab).or_default();
             files.open.push(OpenFile { id, path, kind });
@@ -464,7 +509,7 @@ impl App {
         let files = self.editors.entry(tab).or_default();
         files.open.push(OpenFile { id, path: path.clone(), kind: DocKind::Loading });
         files.shown = Some(id);
-        self.read_doc(id, path)
+        if picture { self.read_picture(id, path) } else { self.read_doc(id, path) }
     }
 
     /// Reads a file for the built-in editor, on a thread.
@@ -476,6 +521,65 @@ impl App {
         Task::perform(async move { rx.recv().await.unwrap_or_else(|_| Err("reading it stopped".into())) }, move |r| {
             Message::Editor(EditorMsg::Loaded(id, r))
         })
+    }
+
+    /// Reads and decodes a picture, on a thread.
+    fn read_picture(&self, id: DocId, path: PathBuf) -> Task<Message> {
+        self.read_picture_as(id, path, EditorMsg::PictureLoaded)
+    }
+
+    /// [`App::read_picture`], answered with `done`.
+    fn read_picture_as(
+        &self,
+        id: DocId,
+        path: PathBuf,
+        done: fn(DocId, Result<FilePicture, String>) -> EditorMsg,
+    ) -> Task<Message> {
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(picture::read(&path));
+        });
+        Task::perform(async move { rx.recv().await.unwrap_or_else(|_| Err("reading it stopped".into())) }, move |r| {
+            Message::Editor(done(id, r))
+        })
+    }
+
+    /// Shows an open SVG's text, in the editor files open in.
+    fn show_as_text(&mut self, id: DocId) -> Task<Message> {
+        if !matches!(self.doc(id), Some((_, d)) if matches!(d.kind, DocKind::Picture(_))) {
+            return Task::none();
+        }
+        self.open_as_text(id)
+    }
+
+    /// Opens an open file's text in place of what it shows now.
+    fn open_as_text(&mut self, id: DocId) -> Task<Message> {
+        let Some((tab, doc)) = self.doc(id) else { return Task::none() };
+        let path = doc.path.clone();
+        self.open_files_dirty = true;
+        if self.prefs.file_editor == FileEditor::Terminal {
+            let Some(kind) = self.launch_editor(tab, &path) else { return Task::none() };
+            if let Some(doc) = self.doc_mut(id) {
+                doc.kind = kind;
+            }
+            return self.focus_active();
+        }
+        if let Some(doc) = self.doc_mut(id) {
+            doc.kind = DocKind::Loading;
+        }
+        self.read_doc(id, path)
+    }
+
+    /// Shows an open SVG's picture instead of its text, once the text is saved.
+    fn show_as_picture(&mut self, id: DocId) -> Task<Message> {
+        let Some(doc) = self.doc_mut(id) else { return Task::none() };
+        if !matches!(&doc.kind, DocKind::Text(t) if !t.modified() && !t.saving) {
+            return Task::none();
+        }
+        doc.kind = DocKind::Loading;
+        let path = doc.path.clone();
+        self.open_files_dirty = true;
+        self.read_picture(id, path)
     }
 
     /// Starts Neovim or Vim (or the editor command set) on `path`, in a
@@ -513,10 +617,10 @@ impl App {
         })
     }
 
-    /// Whether any open file is shown in the built-in editor (and so is
-    /// compared with the disk now and then).
-    pub(crate) fn has_text_docs(&self) -> bool {
-        self.editors.values().flat_map(|f| &f.open).any(|d| matches!(d.kind, DocKind::Text(_)))
+    /// Whether any open file is shown in the built-in editor or as a picture
+    /// (and so is compared with the disk now and then).
+    pub(crate) fn has_files_to_check(&self) -> bool {
+        self.editors.values().flat_map(|f| &f.open).any(|d| matches!(d.kind, DocKind::Text(_) | DocKind::Picture(_)))
     }
 
     /// Looks at every open file on disk, on a thread.
@@ -530,6 +634,7 @@ impl App {
             .flat_map(|f| &f.open)
             .filter_map(|d| match &d.kind {
                 DocKind::Text(t) if !t.saving => Some((d.id, d.path.clone(), t.disk)),
+                DocKind::Picture(p) => Some((d.id, d.path.clone(), p.file.stamp)),
                 _ => None,
             })
             .collect();
@@ -767,7 +872,28 @@ impl App {
             EditorMsg::DiskChecked(checked) => {
                 self.disk_polling = false;
                 let mut reload = Vec::new();
+                let mut reload_pictures = Vec::new();
                 for (id, known, now) in checked {
+                    if let Some(p) = self.picture_mut(id) {
+                        if p.file.stamp != known {
+                            continue;
+                        }
+                        match now {
+                            OnDisk::Same(stamp) => {
+                                p.file.stamp = stamp;
+                                p.deleted = false;
+                            }
+                            OnDisk::Changed(stamp) => {
+                                // Read once per change, however long decoding takes.
+                                p.file.stamp = stamp;
+                                p.deleted = false;
+                                reload_pictures.push(id);
+                            }
+                            OnDisk::Deleted => p.deleted = true,
+                            OnDisk::Unreadable => {}
+                        }
+                        continue;
+                    }
                     let Some(doc) = self.text_mut(id) else { continue };
                     // Saved or reloaded meanwhile: this look is out of date.
                     if doc.saving || doc.disk != known {
@@ -787,7 +913,12 @@ impl App {
                         Reaction::Nothing => {}
                     }
                 }
-                Task::batch(reload.into_iter().map(|id| self.reload_doc(id)))
+                let pictures: Vec<_> = reload_pictures
+                    .into_iter()
+                    .filter_map(|id| Some((id, self.doc(id)?.1.path.clone())))
+                    .map(|(id, path)| self.read_picture_as(id, path, EditorMsg::PictureReloaded))
+                    .collect();
+                Task::batch(reload.into_iter().map(|id| self.reload_doc(id)).chain(pictures))
             }
             EditorMsg::Reload(id) => {
                 self.dialog = None;
@@ -814,6 +945,46 @@ impl App {
                 }
                 self.focus_active()
             }
+            EditorMsg::PictureLoaded(id, Ok(file)) => {
+                if let Some(doc) = self.doc_mut(id).filter(|d| matches!(d.kind, DocKind::Loading)) {
+                    doc.kind = DocKind::Picture(Box::new(PictureDoc { file, zoom: Zoom::default(), deleted: false }));
+                    // Kept as a picture across a restart, even if it was kept while being read.
+                    self.open_files_dirty = true;
+                }
+                Task::none()
+            }
+            EditorMsg::PictureLoaded(id, Err(e)) => {
+                let Some((tab, doc)) = self.doc(id) else { return Task::none() };
+                let name = self.file_label(Some(tab), &doc.path);
+                // An SVG that can't be drawn opens as text, to be put right.
+                if picture::has_text(&doc.path) {
+                    self.error = Some(format!("Can't show {name} as a picture: {e}."));
+                    return self.open_as_text(id);
+                }
+                self.close_doc(id);
+                self.error = Some(format!("Can't open {name}: {e}."));
+                self.focus_active()
+            }
+            EditorMsg::PictureReloaded(id, result) => {
+                match (self.picture_mut(id), result) {
+                    // Same zoom, so a picture an agent keeps changing can be watched.
+                    (Some(p), Ok(file)) => p.file = file,
+                    // Likely read while still being written: the change that
+                    // finishes it is read too, and until then the last good
+                    // picture is better than an error.
+                    (Some(_), Err(e)) => tracing::debug!("picture not read again: {e}"),
+                    (None, _) => {}
+                }
+                Task::none()
+            }
+            EditorMsg::Zoom(id, zoom) => {
+                if let Some(p) = self.picture_mut(id) {
+                    p.zoom = zoom;
+                }
+                Task::none()
+            }
+            EditorMsg::AsText(id) => self.show_as_text(id),
+            EditorMsg::AsPicture(id) => self.show_as_picture(id),
         }
     }
 }

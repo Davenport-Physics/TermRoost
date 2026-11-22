@@ -25,6 +25,12 @@ ttf-parser = "0.25"
 ignore = "0.4"
 # The Files tab hears from the system when the folders it shows change.
 notify = "8.2"
+# Pictures opened from the Files tab: decoded here, on a thread, so the
+# window doesn't stall and a broken file can say why. Only the decoders of
+# common formats (iced's own `image` feature brings an AVIF encoder too).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tga", "pnm", "qoi"] }
+# Reads an SVG's size, and whether it is one at all; the same version iced draws with.
+usvg = { version = "0.45", default-features = false }
 chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

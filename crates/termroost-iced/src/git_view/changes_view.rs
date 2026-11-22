@@ -1,8 +1,9 @@
 //! How the uncommitted changes look: a section for each kind of change,
-//! with a button to stage (or unstage) all of it, then its files, each with
-//! a button for the whole file and one for each hunk. Lines chosen in a
-//! hunk are marked, and its button then stages just those. Above it all
-//! (not scrolled away) is the message of the next commit, and its button.
+//! its title folding it, with a button to stage (or unstage) all of it,
+//! then its files, each with a button for the whole file and one for each
+//! hunk. Lines chosen in a hunk are marked, and its button then stages just
+//! those. Above it all (not scrolled away) is the message of the next
+//! commit with its button, and one that folds or unfolds every file.
 
 use iced::keyboard::Key;
 use iced::keyboard::key::Named;
@@ -11,14 +12,14 @@ use iced::widget::{Row, button, center, column, container, row, space, text, tex
 use iced::{Alignment, Element, Length, Padding};
 use termroost_core::git::{FileDiff, FileStatus, WorkingChanges};
 
-use super::GitViewMsg;
 use super::changes::{ChangesDoc, Pick, Section};
 use super::view::{file_body_with, file_digits, file_header};
+use super::{CHANGES_SCROLL, GitViewMsg};
 use crate::app::{App, Message};
 use crate::diff_lines::DiffLines;
 use crate::editor::DocId;
 use crate::files::FilesMsg;
-use crate::icons::Icon;
+use crate::icons::{Icon, icon};
 use crate::keymap::Keymap;
 use crate::sidebar::muted_text;
 use crate::theme::{self, MONO, SEMIBOLD, Tone};
@@ -115,7 +116,8 @@ impl App {
             .into()
     }
 
-    /// The sections of the changes and their files, scrolled.
+    /// The sections of the changes and their files, scrolled, under a bar
+    /// that folds or unfolds every file.
     fn view_sections<'a>(&'a self, doc: DocId, c: &'a ChangesDoc, changes: &'a WorkingChanges) -> Element<'a, Message> {
         let mut page = column![].spacing(12);
         let mut empty = true;
@@ -125,7 +127,11 @@ impl App {
                 continue;
             }
             empty = false;
-            page = page.push(section_header(doc, section, files.len(), c.busy));
+            let folded = c.section_folded(section);
+            page = page.push(section_header(doc, section, files.len(), folded, c.busy));
+            if folded {
+                continue;
+            }
             for file in files.iter().take(MAX_FILES) {
                 page = page.push(self.changed_file(doc, c, section, file, files.len()));
             }
@@ -142,9 +148,13 @@ impl App {
             };
             page = page.push(container(text(what).size(theme::TEXT).style(ui::muted)).padding([8, 4]));
         }
-        ui::scroll(container(page).padding(Padding { top: 0.0, right: 14.0, bottom: 12.0, left: 4.0 }))
-            .height(Length::Fill)
-            .into()
+        let list = ui::scroll(container(page).padding(Padding { top: 0.0, right: 14.0, bottom: 12.0, left: 4.0 }))
+            .id(CHANGES_SCROLL)
+            .height(Length::Fill);
+        // Always there, so the list keeps its place (and scroll) in the tree.
+        let bar: Element<'a, Message> =
+            if empty { space::vertical().height(0).into() } else { fold_bar(doc, c, changes) };
+        column![bar, list].into()
     }
 
     /// A file of a section: its header with a button for the whole file,
@@ -243,8 +253,21 @@ fn hunk_button<'a>(label: String, press: Option<Message>) -> Element<'a, Message
         .into()
 }
 
-/// A section's title and how many files it has, with a button for all of them.
-fn section_header<'a>(doc: DocId, section: Section, files: usize, busy: bool) -> Element<'a, Message> {
+/// Over the list, not scrolled away: Collapse all while a file shows its
+/// changes, else Expand all.
+fn fold_bar<'a>(doc: DocId, c: &ChangesDoc, changes: &WorkingChanges) -> Element<'a, Message> {
+    let unfolded = c.any_unfolded(changes, MAX_FILES);
+    let label = if unfolded { "Collapse all" } else { "Expand all" };
+    // With every section folded, no file would show either way.
+    let open = Section::ALL.into_iter().any(|s| !c.section_folded(s) && s.files(changes).next().is_some());
+    let press = open.then_some(Message::GitView(GitViewMsg::FoldAll(doc, unfolded)));
+    let toggle = ui::small(label, theme::button_ghost).on_press_maybe(press);
+    row![space::horizontal(), toggle].padding(Padding { top: 0.0, right: 14.0, bottom: 4.0, left: 4.0 }).into()
+}
+
+/// A section's title and how many files it has, with a button for all of
+/// them. Pressed, the title folds or unfolds the section.
+fn section_header<'a>(doc: DocId, section: Section, files: usize, folded: bool, busy: bool) -> Element<'a, Message> {
     let all = match section {
         Section::Staged => "Unstage all",
         Section::Conflicts => "Mark all resolved",
@@ -252,14 +275,19 @@ fn section_header<'a>(doc: DocId, section: Section, files: usize, busy: bool) ->
     };
     let press = (!busy).then_some(Message::GitView(GitViewMsg::Move(doc, Pick::All(section))));
     let tone = if section == Section::Conflicts { Tone::Warning } else { Tone::Neutral };
-    row![
-        text(section.title()).size(theme::TEXT).font(SEMIBOLD),
-        ui::badge(files.to_string(), tone),
-        space::horizontal(),
-        ui::small(all, theme::button_secondary).on_press_maybe(press),
-    ]
-    .spacing(8)
-    .padding(Padding { top: 6.0, right: 0.0, bottom: 0.0, left: 4.0 })
-    .align_y(Alignment::Center)
-    .into()
+    let chevron = icon(if folded { Icon::ChevronRight } else { Icon::ChevronDown }, 13.0, theme::muted);
+    let title =
+        row![chevron, text(section.title()).size(theme::TEXT).font(SEMIBOLD), ui::badge(files.to_string(), tone)]
+            .spacing(8)
+            .align_y(Alignment::Center);
+    let toggle = button(title)
+        .padding(0)
+        .style(theme::button_bare)
+        .on_press(Message::GitView(GitViewMsg::ToggleSection(doc, section)))
+        .width(Length::Fill);
+    row![toggle, ui::small(all, theme::button_secondary).on_press_maybe(press)]
+        .spacing(8)
+        .padding(Padding { top: 6.0, right: 0.0, bottom: 0.0, left: 4.0 })
+        .align_y(Alignment::Center)
+        .into()
 }

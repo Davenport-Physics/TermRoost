@@ -46,17 +46,24 @@ pub struct FileText {
 
 /// Reads `path` as text, or says why it can't be edited.
 pub fn read(path: &Path) -> Result<FileText, String> {
+    let (bytes, stamp) = read_bytes(path, text::MAX_SIZE, text::too_large)?;
+    Ok(FileText { decoded: text::decode(bytes)?, stamp })
+}
+
+/// Reads the file at `path`, if it is no larger than `max` bytes (else
+/// `too_large` says so), with its stamp.
+pub fn read_bytes(path: &Path, max: u64, too_large: impl FnOnce() -> String) -> Result<(Vec<u8>, Stamp), String> {
     // Before reading: a change in between then shows up as a change later.
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     if !meta.is_file() {
         return Err("it is not a file".into());
     }
-    if meta.len() > text::MAX_SIZE {
-        return Err(text::too_large());
+    if meta.len() > max {
+        return Err(too_large());
     }
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let stamp = Stamp::new(&meta, &bytes);
-    Ok(FileText { decoded: text::decode(bytes)?, stamp })
+    Ok((bytes, stamp))
 }
 
 /// How a file on disk compares to what was read or written last.

@@ -22,6 +22,10 @@ use crate::editor::{DocId, DocKind, OpenFile};
 /// next starts at its top.
 const COMMIT_SCROLL: &str = "commit-scroll";
 
+/// Widget id of the scrollable the uncommitted changes are listed in, so
+/// folding or unfolding them all starts at the top.
+const CHANGES_SCROLL: &str = "changes-scroll";
+
 /// Files with more changed lines than this start folded.
 const FOLD_LINES: usize = 1000;
 
@@ -74,6 +78,10 @@ pub enum GitViewMsg {
     ChangesRead(DocId, u64, Box<Result<WorkingChanges, String>>),
     /// Fold or unfold a file of the changes.
     ToggleChange(DocId, Section, String),
+    /// Fold or unfold a section of the changes.
+    ToggleSection(DocId, Section),
+    /// Fold (`true`) or unfold every file of the changes.
+    FoldAll(DocId, bool),
     /// Stage what is picked, or unstage it when it is staged.
     Move(DocId, Pick),
     /// It was staged or unstaged (or why not), and the changes read again.

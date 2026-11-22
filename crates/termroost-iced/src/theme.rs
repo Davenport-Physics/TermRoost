@@ -782,6 +782,12 @@ pub fn title_bar(active: bool) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
+/// The two squares of the checkerboard under the see-through parts of a picture.
+pub fn checkerboard(t: &Theme) -> (Color, Color) {
+    let (bg, ink) = (background(t), ink(t));
+    (mix(bg, ink, by_tone(t, 0.04, 0.05)), mix(bg, ink, by_tone(t, 0.10, 0.12)))
+}
+
 /// A terminal shown on its own, such as Neovim editing a file: framed like a pane.
 pub fn terminal_frame(t: &Theme) -> container::Style {
     container::Style {

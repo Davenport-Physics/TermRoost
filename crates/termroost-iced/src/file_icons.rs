@@ -148,10 +148,9 @@ pub fn file(name: &str) -> Look {
         "csv" | "tsv" => Look(Text, Green),
         "pdf" => Look(Text, Red),
         "diff" | "patch" => Look(Git, Green),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "icns" | "tif" | "tiff" | "avif" | "heic" => {
-            Look(Image, Magenta)
-        }
-        "svg" => Look(Image, Yellow),
+        "png" | "jpg" | "jpeg" | "jfif" | "gif" | "webp" | "bmp" | "ico" | "icns" | "tif" | "tiff" | "avif"
+        | "heic" | "tga" | "qoi" | "pnm" | "pbm" | "pgm" | "ppm" | "pam" => Look(Image, Magenta),
+        "svg" | "svgz" => Look(Image, Yellow),
         "lock" => Look(Lock, Muted),
         "sh" | "bash" | "zsh" | "fish" => Look(Shell, Green),
         "ps1" | "psm1" | "psd1" => Look(Shell, Blue),

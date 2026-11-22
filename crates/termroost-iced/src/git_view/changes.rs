@@ -1,6 +1,6 @@
 //! What is not committed yet in a session's repository, shown in place of
-//! its terminals: files with conflicts, changes not staged, new files, and
-//! staged changes. Whole files, single hunks or all of a section are staged
+//! its terminals: files with conflicts, staged changes, changes not staged,
+//! and new files. Whole files, single hunks or all of a section are staged
 //! and unstaged from here, and so are lines chosen in a hunk: pressed one
 //! by one, dragged over, or with Shift for a range and Ctrl for one more.
 //! What is staged is then committed with a message written above it (or
@@ -12,11 +12,12 @@
 
 use std::collections::{BTreeSet, HashSet};
 
+use iced::widget::operation::{self, RelativeOffset};
 use iced::widget::text_editor;
 use iced::{Task, keyboard};
 use termroost_core::git::{FileDiff, FileStatus, Hunk, LineKind, Repo, WorkingChanges};
 
-use super::{GitViewMsg, starts_folded};
+use super::{CHANGES_SCROLL, GitViewMsg, starts_folded};
 use crate::app::{App, Message};
 use crate::editor::{DocId, DocKind, OpenFile};
 
@@ -28,15 +29,17 @@ const FOLD_UNTRACKED: usize = 20;
 pub enum Section {
     /// Files with a merge conflict.
     Conflicts,
+    Staged,
     /// Changes not staged yet.
     Unstaged,
     /// Files git doesn't track yet.
     Untracked,
-    Staged,
 }
 
 impl Section {
-    pub const ALL: [Section; 4] = [Section::Conflicts, Section::Unstaged, Section::Untracked, Section::Staged];
+    /// In the order shown: conflicts first, as they stop a commit, then what
+    /// the next commit takes, under its message, then what it doesn't yet.
+    pub const ALL: [Section; 4] = [Section::Conflicts, Section::Staged, Section::Unstaged, Section::Untracked];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -114,8 +117,15 @@ pub struct ChangesDoc {
     pub repo: Repo,
     /// `None` until first read.
     pub changes: Option<Result<WorkingChanges, String>>,
-    /// Files the user folded or unfolded (big ones start folded).
+    /// Files the user folded or unfolded (big ones, and staged ones, start
+    /// folded).
     toggled: HashSet<(Section, String)>,
+    /// Every file folded (by Collapse all) or unfolded (by Expand all),
+    /// those that come later too, instead of as they start. Files toggled
+    /// since are the exceptions.
+    all_folded: Option<bool>,
+    /// Sections showing only their title.
+    folded_sections: HashSet<Section>,
     /// Reads started so far, and the number of the one shown.
     reads: u64,
     shown_read: u64,
@@ -146,6 +156,8 @@ impl ChangesDoc {
             repo,
             changes: None,
             toggled: HashSet::new(),
+            all_folded: None,
+            folded_sections: HashSet::new(),
             reads: 0,
             shown_read: 0,
             reading: false,
@@ -167,9 +179,50 @@ impl ChangesDoc {
         !self.busy && (staged || self.amend) && !self.message.text().trim().is_empty()
     }
 
+    /// Whether a file shows only its header. Staged files start folded: a
+    /// list of what the next commit takes, under its message, which grows
+    /// by a line (not a whole diff) for each file staged further down.
     pub fn folded(&self, section: Section, file: &FileDiff, files_in_section: usize) -> bool {
-        let starts = starts_folded(file) || (section == Section::Untracked && files_in_section > FOLD_UNTRACKED);
+        let starts = self.all_folded.unwrap_or_else(|| {
+            starts_folded(file)
+                || section == Section::Staged
+                || (section == Section::Untracked && files_in_section > FOLD_UNTRACKED)
+        });
         starts != self.toggled.contains(&(section, file.path.clone()))
+    }
+
+    /// Folds a file, or unfolds it.
+    fn toggle_file(&mut self, section: Section, path: String) {
+        let key = (section, path);
+        if !self.toggled.remove(&key) {
+            self.toggled.insert(key);
+        }
+    }
+
+    /// Folds every file, or unfolds every file.
+    fn fold_all(&mut self, fold: bool) {
+        self.all_folded = Some(fold);
+        self.toggled.clear();
+    }
+
+    /// Whether a file of a section not folded shows its changes (of those
+    /// shown, the first `max` of each section): Collapse all would fold it.
+    pub fn any_unfolded(&self, changes: &WorkingChanges, max: usize) -> bool {
+        Section::ALL.into_iter().filter(|s| !self.section_folded(*s)).any(|s| {
+            let n = s.files(changes).count();
+            s.files(changes).take(max).any(|f| !self.folded(s, f, n))
+        })
+    }
+
+    pub fn section_folded(&self, section: Section) -> bool {
+        self.folded_sections.contains(&section)
+    }
+
+    /// Folds a section, or unfolds it.
+    fn toggle_section(&mut self, section: Section) {
+        if !self.folded_sections.remove(&section) {
+            self.folded_sections.insert(section);
+        }
     }
 
     /// Takes in a read numbered `n`, unless a later one is shown already.
@@ -441,11 +494,20 @@ impl App {
             }
             GitViewMsg::ToggleChange(doc, section, path) => {
                 if let Some(c) = self.changes_doc_mut(doc) {
-                    let key = (section, path);
-                    if !c.toggled.remove(&key) {
-                        c.toggled.insert(key);
-                    }
+                    c.toggle_file(section, path);
                 }
+            }
+            GitViewMsg::ToggleSection(doc, section) => {
+                if let Some(c) = self.changes_doc_mut(doc) {
+                    c.toggle_section(section);
+                }
+            }
+            GitViewMsg::FoldAll(doc, fold) => {
+                if let Some(c) = self.changes_doc_mut(doc) {
+                    c.fold_all(fold);
+                }
+                // What was in view has moved: start from the top.
+                return operation::snap_to(CHANGES_SCROLL, RelativeOffset::START);
             }
             GitViewMsg::Move(doc, pick) => return self.move_pick(doc, pick),
             GitViewMsg::Moved(doc, n, done, read) => {
@@ -618,5 +680,52 @@ mod tests {
         changes.unstaged[0].hunks[0].lines[1].text = "b2".into();
         d.take(2, Ok(changes));
         assert_eq!(d.chosen, None);
+    }
+
+    #[test]
+    fn staged_files_start_folded() {
+        let mut d = doc();
+        let Some(Ok(changes)) = d.changes.clone() else { unreachable!() };
+        let file = &changes.unstaged[0];
+        assert!(!d.folded(Section::Unstaged, file, 1));
+        assert!(d.folded(Section::Staged, file, 1));
+        // Unfolded by hand, a staged file stays so; the same file unstaged is apart.
+        d.toggle_file(Section::Staged, file.path.clone());
+        assert!(!d.folded(Section::Staged, file, 1));
+        assert!(!d.folded(Section::Unstaged, file, 1));
+    }
+
+    #[test]
+    fn every_file_folds_and_unfolds_at_once() {
+        let mut d = doc();
+        let Some(Ok(mut changes)) = d.changes.clone() else { unreachable!() };
+        let file = changes.unstaged[0].clone();
+        assert!(d.any_unfolded(&changes, 200));
+
+        d.fold_all(true);
+        assert!(d.folded(Section::Unstaged, &file, 1));
+        assert!(!d.any_unfolded(&changes, 200));
+        // Files that come later fold too.
+        let later = FileDiff { path: "later.txt".into(), ..file.clone() };
+        changes.unstaged.push(later.clone());
+        assert!(d.folded(Section::Unstaged, &later, 2));
+        // One unfolded by hand is the exception, until all unfold.
+        d.toggle_file(Section::Unstaged, later.path.clone());
+        assert!(!d.folded(Section::Unstaged, &later, 2));
+        assert!(d.any_unfolded(&changes, 200));
+        d.fold_all(false);
+        assert!(!d.folded(Section::Unstaged, &file, 2));
+        assert!(!d.folded(Section::Unstaged, &later, 2));
+        assert!(!d.folded(Section::Staged, &file, 1));
+        // Folded by hand after that, a file stays folded.
+        d.toggle_file(Section::Unstaged, file.path.clone());
+        assert!(d.folded(Section::Unstaged, &file, 2));
+
+        // Files of folded sections don't count as showing their changes.
+        d.fold_all(false);
+        d.toggle_section(Section::Unstaged);
+        assert!(!d.any_unfolded(&changes, 200));
+        d.toggle_section(Section::Unstaged);
+        assert!(d.any_unfolded(&changes, 200));
     }
 }

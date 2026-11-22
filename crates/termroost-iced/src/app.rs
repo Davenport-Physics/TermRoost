@@ -762,7 +762,7 @@ impl App {
             }
         }
         // Agents change open files: look at them now and then, and when coming back to the window.
-        if self.has_text_docs() && self.window_focused {
+        if self.has_files_to_check() && self.window_focused {
             subs.push(iced::time::every(crate::files::POLL).map(|_| Message::Editor(EditorMsg::DiskPoll)));
         }
         if self.task_drag.is_some() {

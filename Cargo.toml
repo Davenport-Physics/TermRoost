@@ -22,7 +22,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-iced = { version = "0.14", features = ["advanced", "tokio", "svg", "highlighter"] }
+iced = { version = "0.14", features = ["advanced", "tokio", "svg", "highlighter", "image-without-codecs"] }
 rfd = "0.18"
 
 [profile.release]

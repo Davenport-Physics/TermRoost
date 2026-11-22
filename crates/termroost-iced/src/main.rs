@@ -28,6 +28,7 @@ mod notes;
 mod notify;
 mod on_escape;
 mod panes;
+mod picture_view;
 mod remotes;
 mod reorder;
 mod reveal;

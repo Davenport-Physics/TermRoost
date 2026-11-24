@@ -143,6 +143,7 @@ impl App {
             self.appearance_section(st),
             self.terminal_section(st),
             self.editor_section(st),
+            section("Languages", self.languages_rows()),
             self.notifications_section(),
             self.integrations_section(),
             self.shortcuts_section(st),
@@ -485,7 +486,11 @@ impl App {
         rows.push(self.neovim_row(st));
         rows.push(setting(
             "Terminal Rooster's Neovim setup",
-            Some("Language servers, completion and diagnostics. Off: Neovim runs your own configuration.".to_owned()),
+            Some(
+                "Language servers (see Languages), completion and diagnostics. Off: Neovim runs your own \
+                 configuration."
+                    .to_owned(),
+            ),
             ui::switch(st.nvim_setup).on_toggle(Message::NvimSetup),
         ));
         section("Editor", rows)

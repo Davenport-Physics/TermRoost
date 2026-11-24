@@ -92,21 +92,24 @@ impl App {
                 column![framed, deleted_banner(id, p.deleted), self.picture_status(doc, p)].into()
             }
             // Neovim or Vim: a terminal like the session's, with the keyboard
-            // unless a dialog is open.
-            DocKind::Terminal { handle, .. } => container(TerminalView::new(
-                handle.clone(),
-                self.keymap.clone(),
-                self.keyboard_focus.clone(),
-                self.dialog.is_none(),
-                self.prefs.font_size,
-                Message::Noop,
-                Message::Noop,
-            ))
-            .padding(1)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(theme::terminal_frame)
-            .into(),
+            // unless a dialog is open; under it, an offer of the file's
+            // language support.
+            DocKind::Terminal { handle, languages, .. } => {
+                let terminal = container(TerminalView::new(
+                    handle.clone(),
+                    self.keymap.clone(),
+                    self.keyboard_focus.clone(),
+                    self.dialog.is_none(),
+                    self.prefs.font_size,
+                    Message::Noop,
+                    Message::Noop,
+                ))
+                .padding(1)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(theme::terminal_frame);
+                column![terminal, self.language_banner(languages)].into()
+            }
             DocKind::Text(t) => {
                 let id = doc.id;
                 let keymap = self.keymap.clone();

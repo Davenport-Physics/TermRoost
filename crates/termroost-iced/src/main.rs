@@ -21,6 +21,7 @@ mod groups;
 mod host_exe;
 mod icons;
 mod keymap;
+mod languages;
 mod layout_conv;
 mod leave_room;
 mod logging;

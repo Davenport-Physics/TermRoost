@@ -22,6 +22,7 @@ use crate::git_panel::{GitLog, GitSync, LogRead, SyncOp};
 use crate::git_view::GitViewMsg;
 use crate::groups;
 use crate::keymap::{Action, Combo, Keymap};
+use crate::languages::{InstallMode, LangMsg, Languages};
 use crate::layout_conv;
 use crate::notes::{NOTE_EDITOR, Notes, NotesMsg};
 use crate::notify::{self, Category, Level, Notice, PaneNotices, Toast};
@@ -94,6 +95,8 @@ pub struct Prefs {
     /// Neovim runs with Terminal Rooster's setup (language servers and
     /// such); `None` does unless the user has a configuration of their own.
     pub nvim_setup: Option<bool>,
+    /// Whether to ask before installing a language's support.
+    pub install_languages: InstallMode,
     /// The note the Notes tab shows.
     pub note: Option<NoteId>,
 }
@@ -123,6 +126,7 @@ impl Default for Prefs {
             file_editor: FileEditor::Builtin,
             editor_command: String::new(),
             nvim_setup: None,
+            install_languages: InstallMode::Ask,
             note: None,
         }
     }
@@ -420,6 +424,7 @@ pub enum Message {
     EditorCommand(String),
     /// Run Neovim with Terminal Rooster's setup, or not (settings).
     NvimSetup(bool),
+    Languages(LangMsg),
     NewTaskInput(String),
     AddTask,
     TaskDone(TaskId, bool),
@@ -531,6 +536,7 @@ pub struct App {
     pub(crate) shells: Vec<ShellOption>,
     pub(crate) bash_install: InstallState,
     pub(crate) nvim_install: InstallState,
+    pub(crate) languages: Languages,
     pub(crate) system_mode: iced::theme::Mode,
     ui_theme: iced::Theme,
     /// Cached Codex integration state (reads files, so refreshed on demand).
@@ -640,6 +646,7 @@ impl App {
             shells: Vec::new(),
             bash_install: InstallState::Idle,
             nvim_install: InstallState::Idle,
+            languages: Languages::default(),
             system_mode: iced::theme::Mode::None,
             ui_theme: ThemeDef::dark().iced_theme(),
             codex_hook: termroost_core::CodexHookStatus::default(),
@@ -1264,8 +1271,8 @@ impl App {
                     ..SettingsState::default()
                 });
                 self.codex_hook = self.core.codex_hook_status();
-                // Pick up shells installed since the last look.
-                return detect_shells();
+                // Pick up shells, Node or .NET installed since the last look.
+                return Task::batch([detect_shells(), self.detect_languages()]);
             }
             Message::AddCodexHook => {
                 self.prefs.codex_hook_asked = true;
@@ -1777,6 +1784,7 @@ impl App {
                     st.nvim_setup = on;
                 }
             }
+            Message::Languages(msg) => return self.update_languages(msg),
             Message::NewTaskInput(v) => self.new_task = v,
             Message::AddTask => {
                 let title = std::mem::take(&mut self.new_task);

@@ -1,6 +1,6 @@
 //! Language servers: which one serves a file, whether it is installed, and
-//! installing it, so Neovim can complete, check and navigate code without
-//! any setup of the user's own.
+//! installing it, so Neovim (see [`nvim`]) can complete, check and navigate
+//! code without any setup of the user's own.
 //!
 //! Servers are installed into Terminal Rooster's own folder with what the
 //! computer already has: npm for the ones written for Node, `dotnet tool`
@@ -8,6 +8,7 @@
 //! never installed; without them a language says what it needs.
 
 mod install;
+pub mod nvim;
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;

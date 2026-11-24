@@ -7,7 +7,7 @@ use super::{DONE_FILE, Package, Runtimes, entry_points, package_dir, servers};
 use crate::Error;
 
 /// Installs `p` (again, if it was), blocking until it is done: run it on a
-/// thread.
+/// thread. Afterwards Neovim setups that are running start its servers.
 pub fn install(p: Package) -> crate::Result<()> {
     let rt = Runtimes::detect();
     match p {
@@ -39,6 +39,9 @@ pub fn install(p: Package) -> crate::Result<()> {
             run(&mut cmd, "npm")?;
             finish(p, &dir)?;
         }
+    }
+    if let Err(e) = super::nvim::write_servers() {
+        tracing::warn!(error = %e, "could not tell Neovim about the new language servers");
     }
     tracing::info!(package = ?p, "installed language support");
     Ok(())

@@ -91,6 +91,9 @@ pub struct Prefs {
     /// The terminal editor's command line (the file is added at the end);
     /// empty finds Neovim or Vim.
     pub editor_command: String,
+    /// Neovim runs with Terminal Rooster's setup (language servers and
+    /// such); `None` does unless the user has a configuration of their own.
+    pub nvim_setup: Option<bool>,
     /// The note the Notes tab shows.
     pub note: Option<NoteId>,
 }
@@ -119,6 +122,7 @@ impl Default for Prefs {
             pull_rebase: true,
             file_editor: FileEditor::Builtin,
             editor_command: String::new(),
+            nvim_setup: None,
             note: None,
         }
     }
@@ -243,6 +247,9 @@ pub struct SettingsState {
     pub editor_found: Option<PathBuf>,
     /// The user's own Neovim, on PATH.
     pub nvim_on_path: Option<PathBuf>,
+    /// Whether Neovim runs with Terminal Rooster's setup (see
+    /// [`App::nvim_setup_on`]).
+    pub nvim_setup: bool,
     /// Why the file manager didn't open on the data or logs folder.
     pub folder_error: Option<String>,
 }
@@ -411,6 +418,8 @@ pub enum Message {
     FileEditor(FileEditor),
     /// The terminal editor's command line changed (settings).
     EditorCommand(String),
+    /// Run Neovim with Terminal Rooster's setup, or not (settings).
+    NvimSetup(bool),
     NewTaskInput(String),
     AddTask,
     TaskDone(TaskId, bool),
@@ -1246,8 +1255,14 @@ impl App {
                 let editor_found = shell::find_terminal_editor().map(|e| e.program);
                 let path = std::env::var_os("PATH").unwrap_or_default();
                 let nvim_on_path = shell::find_program("nvim", &path);
-                self.settings =
-                    Some(SettingsState { shell_input, editor_found, nvim_on_path, ..SettingsState::default() });
+                let nvim_setup = self.nvim_setup_on();
+                self.settings = Some(SettingsState {
+                    shell_input,
+                    editor_found,
+                    nvim_on_path,
+                    nvim_setup,
+                    ..SettingsState::default()
+                });
                 self.codex_hook = self.core.codex_hook_status();
                 // Pick up shells installed since the last look.
                 return detect_shells();
@@ -1754,6 +1769,13 @@ impl App {
             Message::EditorCommand(command) => {
                 self.prefs.editor_command = command;
                 self.mark_prefs();
+            }
+            Message::NvimSetup(on) => {
+                self.prefs.nvim_setup = Some(on);
+                self.mark_prefs();
+                if let Some(st) = &mut self.settings {
+                    st.nvim_setup = on;
+                }
             }
             Message::NewTaskInput(v) => self.new_task = v,
             Message::AddTask => {

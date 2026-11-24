@@ -473,16 +473,21 @@ impl App {
             stacked(
                 "Terminal editor command",
                 Some(
-                    "Neovim or Vim runs in a terminal, with your own configuration; quitting it (:q) closes the file. \
-                     The file's path is added to the command. Leave it empty to use Neovim, or Vim when there is no \
-                     Neovim. Ctrl+Shift shortcuts and Alt+arrows stay with Terminal Rooster; every other key goes to \
-                     the editor."
+                    "Neovim or Vim runs in a terminal; quitting it (:q) closes the file. A command set here runs with \
+                     your own configuration. The file's path is added to the command. Leave it empty to use Neovim, \
+                     or Vim when there is no Neovim. Ctrl+Shift shortcuts and Alt+arrows stay with Terminal Rooster; \
+                     every other key goes to the editor."
                         .to_owned(),
                 ),
                 ui::input(&placeholder, &self.prefs.editor_command).on_input(Message::EditorCommand),
             ),
         ];
         rows.push(self.neovim_row(st));
+        rows.push(setting(
+            "Terminal Rooster's Neovim setup",
+            Some("Language servers, completion and diagnostics. Off: Neovim runs your own configuration.".to_owned()),
+            ui::switch(st.nvim_setup).on_toggle(Message::NvimSetup),
+        ));
         section("Editor", rows)
     }
 

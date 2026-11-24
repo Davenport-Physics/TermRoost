@@ -22,7 +22,7 @@ use iced::Task;
 use iced::widget::operation;
 use iced::widget::text_editor::{self, Action, Cursor, Edit, Position};
 use serde::{Deserialize, Serialize};
-use termroost_core::{GridSize, PaneId, TabId, TerminalHandle};
+use termroost_core::{GridSize, PaneId, TabId, TerminalHandle, lsp};
 
 use crate::app::{App, Dialog, Message, RunningTerminal};
 use crate::git_view::{ChangesDoc, CommitDoc};
@@ -582,13 +582,32 @@ impl App {
         self.read_picture(id, path)
     }
 
+    /// Whether Neovim runs with Terminal Rooster's setup: as the settings
+    /// say, else unless the user has a configuration of their own.
+    pub(crate) fn nvim_setup_on(&self) -> bool {
+        self.prefs.nvim_setup.unwrap_or_else(|| lsp::nvim::own_config().is_none())
+    }
+
     /// Starts Neovim or Vim (or the editor command set) on `path`, in a
     /// terminal in session `tab`'s folder. `None`, with a banner saying why,
     /// when it can't.
     fn launch_editor(&mut self, tab: TabId, path: &Path) -> Option<DocKind> {
         let s = self.core.state();
         let root = s.tab(tab).map(|t| s.tab_working_dir(t))?;
-        let launch = match external::launch_here(&self.prefs.editor_command, path, &root) {
+        let use_setup = self.nvim_setup_on();
+        let setup = || {
+            if !use_setup {
+                return None;
+            }
+            match lsp::nvim::prepare() {
+                Ok(init) => Some(init),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not write Terminal Rooster's Neovim setup");
+                    None
+                }
+            }
+        };
+        let launch = match external::launch_here(&self.prefs.editor_command, path, &root, setup) {
             Ok(l) => l,
             Err(e) => {
                 self.error = Some(format!("Can't open {} in an editor: {e}.", self.file_label(Some(tab), path)));

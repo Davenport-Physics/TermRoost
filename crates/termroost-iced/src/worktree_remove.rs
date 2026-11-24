@@ -149,6 +149,11 @@ impl App {
         self.removals.iter().find(|r| git::same_path(&r.path, path))
     }
 
+    /// Folders of the worktrees git is removing now, for the quit dialog.
+    pub(crate) fn removing_worktrees(&self) -> Vec<String> {
+        self.removals.iter().filter(|r| r.failed.is_none()).map(|r| display_dir(&r.path)).collect()
+    }
+
     /// Swaps the Worktrees dialog for the question whether to remove `path`.
     fn ask_remove(&mut self, path: PathBuf) -> Task<Message> {
         let Some(Dialog::Worktree(back)) = self.dialog.take() else { return Task::none() };

@@ -246,9 +246,12 @@ impl App {
         let others = if end_others { others.unwrap_or_default() } else { Vec::new() };
         let repo = back.repo.clone();
         let mut left = self.core.leave_dir(&path);
-        for tab in &left.closed {
-            self.grids.remove(tab);
-            self.activity.remove(tab);
+        for tab in left.closed.clone() {
+            self.grids.remove(&tab);
+            self.activity.remove(&tab);
+            // A file open in Neovim keeps it running in the folder.
+            let editors = self.drop_session_files(tab);
+            left.pids.extend(editors);
         }
         if self.core.state().tab(back.tab).is_some() {
             self.dialog = Some(Dialog::Worktree(back));

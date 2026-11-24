@@ -54,6 +54,8 @@ Each session shows the branch its directory is on.
 
 Removing closes the sessions working in the worktree, waits for their programs to exit (Windows cannot delete a folder a program is still in), and keeps the branch; uncommitted changes are only deleted when you tick **Delete them too**. Other programs working in the folder are listed, and it is only deleted once you tick **End them**. If something still keeps part of the folder, git drops the worktree anyway, and **Delete the rest** deletes what is left.
 
+The deleting goes on in the background: the dialog goes back to the list, where the worktree shows **Removing…** until it is gone, so you can remove the next one or close the dialog and carry on. If git can't remove it, its row says why (a banner does when the dialog is closed), and **Remove** tries again. Quitting while a worktree is still being removed asks first.
+
 Its **New worktree** part runs `git worktree add` beside the repository, so on the same drive (`app` → `app-feature-x`), and opens the worktree in a new session named after the branch, or moves this session there when **Move … into it** is checked. When a session moves, idle terminals restart in the worktree with their scrollback kept. Terminals running a program or an agent are left alone.
 
 ### Log

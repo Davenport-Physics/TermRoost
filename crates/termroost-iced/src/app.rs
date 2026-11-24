@@ -32,7 +32,7 @@ use crate::theme;
 use crate::themes::{self, ColorField, Hex, ThemeDef, ThemeStore};
 use crate::ui;
 use crate::worktree::{WorktreeForm, WorktreeMsg};
-use crate::worktree_remove::{RemoveForm, RemoveMsg};
+use crate::worktree_remove::{Removal, RemoveForm, RemoveMsg};
 
 /// How often the branches of the visible sessions, and the git log when it
 /// shows, are checked again.
@@ -509,6 +509,8 @@ pub struct App {
     git_polling: bool,
     /// Session folders deleted outside the app (see `gone_folders`).
     pub(crate) gone: HashSet<PathBuf>,
+    /// Worktrees git is removing in the background, and ones it failed to.
+    pub(crate) removals: Vec<Removal>,
     /// The log in the side panel's Git tab.
     pub(crate) git_log: Option<GitLog>,
     /// The Git tab's last pull, push or change of remote.
@@ -622,6 +624,7 @@ impl App {
             git: HashMap::new(),
             git_polling: false,
             gone: HashSet::new(),
+            removals: Vec::new(),
             git_log: None,
             git_sync: None,
             log_reading: false,
@@ -1574,7 +1577,6 @@ impl App {
                 match &self.dialog {
                     // git is making the worktree; the result moves the session.
                     Some(Dialog::Worktree(f)) if f.creating => return Task::none(),
-                    Some(Dialog::RemoveWorktree(f)) if f.removing => return Task::none(),
                     Some(Dialog::Remotes(f)) if f.busy.is_some() => return Task::none(),
                     Some(Dialog::RemoveWorktree(_)) => {
                         self.cancel_remove();

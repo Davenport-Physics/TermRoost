@@ -5,11 +5,11 @@
 //! New worktrees go beside the repository (so on the same drive), named
 //! `<repository>-<branch>`. Removing one is in [`crate::worktree_remove`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use iced::widget::{column, container, operation, row, space, text};
 use iced::{Alignment, Element, Length, Task};
-use termroost_core::git::{self, Branches, Head, Plan, Repo};
+use termroost_core::git::{self, Branches, Head, Plan, Repo, Worktree};
 use termroost_core::{Command, Outcome, TabId};
 
 use crate::app::{App, DIALOG_FIRST_INPUT, Dialog, Message, expand_home};
@@ -17,7 +17,7 @@ use crate::dialogs::DialogParts;
 use crate::sidebar::{branch_label, display_dir, muted_text, short_dir};
 use crate::theme::{self, SEMIBOLD, Tone};
 use crate::ui::{self, field};
-use crate::worktree_remove::RemoveMsg;
+use crate::worktree_remove::{Removal, RemoveMsg};
 
 /// State of the Worktrees dialog.
 #[derive(Clone, Debug)]
@@ -108,6 +108,18 @@ fn msg(m: WorktreeMsg) -> Message {
     Message::Worktree(m)
 }
 
+/// Reads the repository's branches and worktrees on a thread, for the
+/// Worktrees dialog of `tab`.
+fn load_worktrees(tab: TabId, repo: Repo) -> Task<Message> {
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(repo.branches());
+    });
+    Task::perform(async move { rx.recv().await.unwrap_or_else(|e| Err(e.to_string())) }, move |r| {
+        msg(WorktreeMsg::Loaded(tab, r))
+    })
+}
+
 /// Width of a worktree's Remove button, kept free on the main one's row.
 const REMOVE_WIDTH: f32 = 66.0;
 
@@ -120,13 +132,48 @@ fn subheading(label: &str) -> text::Text<'_> {
     text(label).size(13).font(SEMIBOLD)
 }
 
+/// Small text about something that went wrong.
+fn problem_text<'a>(s: impl text::IntoFragment<'a>) -> text::Text<'a> {
+    text(s).size(12).style(|t: &iced::Theme| text::Style { color: Some(t.extended_palette().danger.base.color) })
+}
+
+/// A row of the worktree list: its branch and folder, why removing it
+/// failed (if it did), then `actions`.
+fn worktree_row<'a>(
+    head: Option<&Head>,
+    path: &Path,
+    removal: Option<&Removal>,
+    actions: Vec<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let mut about = column![].spacing(2).width(Length::Fill);
+    if let Some(head) = head {
+        about = about.push(branch_label(head, 13.0, 40));
+    }
+    about = about.push(muted_text(short_dir(path, 52)).size(12).wrapping(text::Wrapping::None));
+    if let Some(r) = removal
+        && let Some(e) = &r.failed
+    {
+        about = about.push(problem_text(if r.leftover {
+            format!("Gone from git, but part of its folder is left: {e}")
+        } else {
+            format!("git did not remove it: {e}")
+        }));
+    }
+    row(std::iter::once(about.into()).chain(actions)).spacing(8).align_y(Alignment::Center).padding([8, 12]).into()
+}
+
 impl App {
     pub(crate) fn update_worktree(&mut self, m: WorktreeMsg) -> Task<Message> {
         match m {
             WorktreeMsg::Open => return self.open_worktree_dialog(),
             WorktreeMsg::Loaded(tab, result) => {
-                if let Some(f) = self.worktree_form().filter(|f| f.tab == tab) {
-                    f.branches = Some(result);
+                let Some(f) = self.worktrees_of_tab(tab) else { return Task::none() };
+                let common_dir = f.repo.common_dir.clone();
+                let listed: Option<Vec<PathBuf>> =
+                    result.as_ref().ok().map(|b| b.worktrees.iter().map(|w| w.path.clone()).collect());
+                f.branches = Some(result);
+                if let Some(listed) = listed {
+                    self.settle_removals(&common_dir, &listed);
                 }
             }
             WorktreeMsg::Switch(path) => {
@@ -208,6 +255,34 @@ impl App {
         }
     }
 
+    /// The Worktrees dialog, shown or behind the question whether to remove one.
+    fn worktrees_behind(&mut self) -> Option<&mut WorktreeForm> {
+        match &mut self.dialog {
+            Some(Dialog::Worktree(f)) => Some(f),
+            Some(Dialog::RemoveWorktree(f)) => Some(&mut f.back),
+            _ => None,
+        }
+    }
+
+    fn worktrees_of_tab(&mut self, tab: TabId) -> Option<&mut WorktreeForm> {
+        self.worktrees_behind().filter(|f| f.tab == tab)
+    }
+
+    /// The Worktrees dialog (shown or behind) when it lists the worktrees of
+    /// the repository whose shared git directory is `common_dir`.
+    pub(crate) fn worktrees_of(&mut self, common_dir: &Path) -> Option<&mut WorktreeForm> {
+        self.worktrees_behind().filter(|f| git::same_path(&f.repo.common_dir, common_dir))
+    }
+
+    /// Reads the worktrees again for the Worktrees dialog, if it lists the
+    /// repository's; the old list stays until then.
+    pub(crate) fn reload_worktrees(&mut self, common_dir: &Path) -> Task<Message> {
+        match self.worktrees_of(common_dir) {
+            Some(f) => load_worktrees(f.tab, f.repo.clone()),
+            None => Task::none(),
+        }
+    }
+
     fn open_worktree_dialog(&mut self) -> Task<Message> {
         let s = self.core.state();
         let Some(tab) = s.active_tab() else { return Task::none() };
@@ -217,11 +292,7 @@ impl App {
             return Task::none();
         };
         let tab = tab.id;
-        let repo = status.repo.clone();
-        let (tx, rx) = async_channel::bounded(1);
-        std::thread::spawn(move || {
-            let _ = tx.send_blocking(repo.branches());
-        });
+        let loaded = load_worktrees(tab, status.repo.clone());
         self.dialog = Some(Dialog::Worktree(Box::new(WorktreeForm {
             tab,
             from,
@@ -236,9 +307,6 @@ impl App {
             creating: false,
             error: None,
         })));
-        let loaded = Task::perform(async move { rx.recv().await.unwrap_or_else(|e| Err(e.to_string())) }, move |r| {
-            msg(WorktreeMsg::Loaded(tab, r))
-        });
         Task::batch([loaded, operation::focus(DIALOG_FIRST_INPUT)])
     }
 
@@ -297,49 +365,60 @@ impl App {
         Task::batch([self.read_git(), self.focus_active()])
     }
 
-    /// The repository's worktrees, each with what can be done with it.
+    /// The repository's worktrees, each with what can be done with it. One
+    /// being removed says so; one git failed to remove says why.
     fn view_worktree_list<'a>(&'a self, f: &'a WorktreeForm) -> Element<'a, Message> {
-        let (worktrees, main) = match &f.branches {
+        let b = match &f.branches {
             None => return muted_text("Looking up worktrees…").size(12).into(),
             Some(Err(e)) => return ui::note_text(Tone::Danger, e),
-            // git lists the main working tree first.
-            Some(Ok(b)) => (b.worktrees.iter().filter(|w| w.usable()), b.worktrees.first().map(|w| &w.path)),
+            Some(Ok(b)) => b,
         };
-        let rows = worktrees.map(|w| {
-            let here = git::same_path(&w.path, &f.repo.worktree);
-            let idle = !f.creating;
-            let switch: Element<'_, Message> = if here {
-                muted_text("this session").size(12).into()
-            } else {
-                small_button("Switch").on_press_maybe(idle.then(|| msg(WorktreeMsg::Switch(w.path.clone())))).into()
-            };
-            let open =
-                small_button("New session").on_press_maybe(idle.then(|| msg(WorktreeMsg::NewSession(w.path.clone()))));
-            // The main working tree holds the repository; git won't remove it.
-            let remove: Element<'_, Message> = if main == Some(&w.path) {
-                space::horizontal().width(REMOVE_WIDTH).into()
-            } else {
-                ui::small("Remove", theme::button_link(Tone::Danger))
-                    .width(REMOVE_WIDTH)
-                    .on_press_maybe(idle.then(|| Message::RemoveWorktree(RemoveMsg::Ask(w.path.clone()))))
-                    .into()
-            };
-            let head = w.head.as_ref().expect("usable worktrees have a HEAD");
-            row![
-                column![
-                    branch_label(head, 13.0, 40),
-                    muted_text(short_dir(&w.path, 52)).size(12).wrapping(text::Wrapping::None)
-                ]
-                .spacing(2)
-                .width(Length::Fill),
-                switch,
-                open,
-                remove,
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center)
-            .padding([8, 12])
+        // git lists the main working tree first.
+        let main = b.worktrees.first().map(|w| &w.path);
+        let listed: Vec<&Worktree> = b.worktrees.iter().filter(|w| w.usable()).collect();
+        // Removals git no longer lists (being deleted, or left over) stay until done.
+        let unlisted = self.removals.iter().filter(|r| {
+            git::same_path(&r.common_dir, &f.repo.common_dir)
+                && !listed.iter().any(|w| git::same_path(&w.path, &r.path))
         });
+        let idle = !f.creating;
+        let remove = |path: &Path| {
+            ui::small("Remove", theme::button_link(Tone::Danger))
+                .width(REMOVE_WIDTH)
+                .on_press_maybe(idle.then(|| Message::RemoveWorktree(RemoveMsg::Ask(path.to_path_buf()))))
+                .into()
+        };
+        let removing = || muted_text("Removing…").size(12).into();
+        let rows = listed
+            .iter()
+            .map(|w| {
+                let removal = self.removal(&w.path);
+                let actions = if removal.is_some_and(|r| r.failed.is_none()) {
+                    vec![removing()]
+                } else {
+                    let switch: Element<'_, Message> = if git::same_path(&w.path, &f.repo.worktree) {
+                        muted_text("this session").size(12).into()
+                    } else {
+                        small_button("Switch")
+                            .on_press_maybe(idle.then(|| msg(WorktreeMsg::Switch(w.path.clone()))))
+                            .into()
+                    };
+                    let open = small_button("New session")
+                        .on_press_maybe(idle.then(|| msg(WorktreeMsg::NewSession(w.path.clone()))));
+                    // The main working tree holds the repository; git won't remove it.
+                    let remove = if main == Some(&w.path) {
+                        space::horizontal().width(REMOVE_WIDTH).into()
+                    } else {
+                        remove(&w.path)
+                    };
+                    vec![switch, open.into(), remove]
+                };
+                worktree_row(w.head.as_ref(), &w.path, removal, actions)
+            })
+            .chain(unlisted.map(|r| {
+                let actions = if r.failed.is_none() { vec![removing()] } else { vec![remove(&r.path)] };
+                worktree_row(r.head.as_ref(), &r.path, Some(r), actions)
+            }));
         // A hairline between each worktree and the next.
         let mut list = column![];
         for (i, r) in rows.enumerate() {
@@ -371,14 +450,8 @@ impl App {
             ),
             (_, Some(Plan::CheckedOut(_))) => (format!("{name} has a worktree already; switch to it above."), true),
         };
-        let hint: Element<'_, Message> = if problem {
-            text(hint)
-                .size(12)
-                .style(|t: &iced::Theme| text::Style { color: Some(t.extended_palette().danger.base.color) })
-                .into()
-        } else {
-            muted_text(hint).size(12).into()
-        };
+        let hint: Element<'_, Message> =
+            if problem { problem_text(hint).into() } else { muted_text(hint).size(12).into() };
 
         let mut col = column![
             text(format!("{session} is on {on} in {}.", display_dir(&f.repo.worktree))).size(13),

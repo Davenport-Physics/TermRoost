@@ -1,8 +1,10 @@
 //! Removing a git worktree from the Worktrees dialog. The sessions working
 //! in it are closed, and git deletes the folder once the processes that ran
 //! there have exited (Windows cannot delete a folder a process works in).
+//! That goes on in the background: the dialog goes back to the list, which
+//! marks the worktree until git is done.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use iced::widget::{column, container, row, text};
@@ -45,13 +47,28 @@ pub struct RemoveForm {
     pub changes: Option<Result<usize, String>>,
     /// Delete uncommitted changes too.
     pub discard: bool,
-    pub removing: bool,
-    /// Sessions an earlier attempt closed before git refused.
-    pub closed: usize,
     /// An earlier attempt removed the worktree from git but left part of
     /// its folder.
     pub leftover: bool,
+    /// Why an earlier attempt failed.
     pub error: Option<String>,
+}
+
+/// A worktree being removed in the background, or whose removal failed
+/// (see [`App::removals`]).
+#[derive(Clone, Debug)]
+pub struct Removal {
+    /// The repository's shared git directory, to tell its worktrees from
+    /// other repositories'.
+    pub common_dir: PathBuf,
+    pub path: PathBuf,
+    pub head: Option<Head>,
+    /// Why git did not remove it; `None` while it is at it.
+    pub failed: Option<String>,
+    /// git no longer knows the worktree, but part of its folder is left.
+    pub leftover: bool,
+    /// The error banner put up about the failure, taken down on a retry.
+    pub banner: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,7 +99,7 @@ impl RemoveForm {
             };
         // Deleting around a program would leave part of the folder.
         let others = self.others.as_ref().is_some_and(|o| o.is_empty() || self.end_others);
-        !self.removing && changes && others
+        changes && others
     }
 }
 
@@ -115,27 +132,7 @@ impl App {
                 }
             }
             RemoveMsg::Confirm => return self.confirm_remove(),
-            RemoveMsg::Removed { path, result, leftover } => {
-                let Some(f) = self.remove_form().filter(|f| f.path == path) else { return Task::none() };
-                f.removing = false;
-                match result {
-                    Ok(()) => {
-                        // The dialog said what removing it does; closing is enough.
-                        tracing::info!(path = %path.display(), sessions_closed = f.closed, "worktree removed");
-                        self.dialog = None;
-                        return Task::batch([self.read_git(), self.focus_active()]);
-                    }
-                    Err(e) => {
-                        tracing::warn!(path = %path.display(), error = %e, leftover, "removing a worktree failed");
-                        f.error = Some(e);
-                        f.leftover = leftover;
-                        // What keeps the folder now.
-                        f.others = None;
-                        f.end_others = false;
-                        return self.look_for_others(path);
-                    }
-                }
-            }
+            RemoveMsg::Removed { path, result, leftover } => return self.removed(path, result, leftover),
         }
         Task::none()
     }
@@ -147,9 +144,21 @@ impl App {
         }
     }
 
+    /// The removal of the worktree at `path`, running or failed.
+    pub(crate) fn removal(&self, path: &Path) -> Option<&Removal> {
+        self.removals.iter().find(|r| git::same_path(&r.path, path))
+    }
+
     /// Swaps the Worktrees dialog for the question whether to remove `path`.
     fn ask_remove(&mut self, path: PathBuf) -> Task<Message> {
         let Some(Dialog::Worktree(back)) = self.dialog.take() else { return Task::none() };
+        let earlier = self.removal(&path).cloned();
+        if earlier.as_ref().is_some_and(|r| r.failed.is_none()) {
+            // git is at it already.
+            self.dialog = Some(Dialog::Worktree(back));
+            return Task::none();
+        }
+        let leftover = earlier.as_ref().is_some_and(|r| r.leftover);
         let s = self.core.state();
         let sessions: Vec<TabId> =
             s.tabs.iter().filter(|t| git::is_within(&s.tab_working_dir(t), &path)).map(|t| t.id).collect();
@@ -165,7 +174,8 @@ impl App {
             .as_ref()
             .and_then(|b| b.as_ref().ok())
             .and_then(|b| b.worktrees.iter().find(|w| w.path == path))
-            .and_then(|w| w.head.clone());
+            .and_then(|w| w.head.clone())
+            .or_else(|| earlier.as_ref().and_then(|r| r.head.clone()));
         self.dialog = Some(Dialog::RemoveWorktree(Box::new(RemoveForm {
             back,
             path: path.clone(),
@@ -177,17 +187,19 @@ impl App {
             end_others: false,
             changes: None,
             discard: false,
-            removing: false,
-            closed: 0,
-            leftover: false,
-            error: None,
+            leftover,
+            error: earlier.and_then(|r| r.failed),
         })));
+        let others = self.look_for_others(path.clone());
+        // What is left of a worktree git forgot has no changes to count.
+        if leftover {
+            return others;
+        }
         let (tx, rx) = async_channel::bounded(1);
         let dir = path.clone();
         std::thread::spawn(move || {
             let _ = tx.send_blocking(Repo::changes(&dir));
         });
-        let others = self.look_for_others(path.clone());
         let changes = Task::perform(async move { rx.recv().await.unwrap_or_else(|e| Err(e.to_string())) }, move |c| {
             msg(RemoveMsg::Changes(path.clone(), c))
         });
@@ -211,7 +223,6 @@ impl App {
     pub(crate) fn cancel_remove(&mut self) {
         if let Some(Dialog::RemoveWorktree(f)) = self.dialog.take()
             && self.core.state().tab(f.back.tab).is_some()
-            && f.closed == 0
         {
             self.dialog = Some(Dialog::Worktree(f.back));
         }
@@ -220,21 +231,38 @@ impl App {
     /// Closes the worktree's sessions (and ends the other programs working
     /// there, if asked to), then has git remove it on a thread once their
     /// processes are gone. After git left part of the folder, deletes the rest.
+    /// Meanwhile the Worktrees dialog is back, unless its own session closed.
     fn confirm_remove(&mut self) -> Task<Message> {
-        let Some(f) = self.remove_form().filter(|f| f.can_remove()) else { return Task::none() };
-        let (path, force, was_leftover, repo) = (f.path.clone(), f.discard, f.leftover, f.back.repo.clone());
-        let others = if f.end_others { f.others.clone().unwrap_or_default() } else { Vec::new() };
+        if !self.remove_form().is_some_and(|f| f.can_remove()) {
+            return Task::none();
+        }
+        let Some(Dialog::RemoveWorktree(f)) = self.dialog.take() else { return Task::none() };
+        let RemoveForm { back, path, head, others, end_others, discard: force, leftover: was_leftover, .. } = *f;
+        let others = if end_others { others.unwrap_or_default() } else { Vec::new() };
+        let repo = back.repo.clone();
         let mut left = self.core.leave_dir(&path);
         for tab in &left.closed {
             self.grids.remove(tab);
             self.activity.remove(tab);
         }
-        if let Some(f) = self.remove_form() {
-            f.removing = true;
-            f.error = None;
-            f.closed += left.closed.len();
-            f.running.clear();
+        if self.core.state().tab(back.tab).is_some() {
+            self.dialog = Some(Dialog::Worktree(back));
         }
+        if let Some(earlier) = self.removal(&path)
+            && earlier.banner.is_some()
+            && earlier.banner == self.error
+        {
+            self.error = None;
+        }
+        self.removals.retain(|r| !git::same_path(&r.path, &path));
+        self.removals.push(Removal {
+            common_dir: repo.common_dir.clone(),
+            path: path.clone(),
+            head,
+            failed: None,
+            leftover: false,
+            banner: None,
+        });
         let (tx, rx) = async_channel::bounded(1);
         let target = path.clone();
         std::thread::spawn(move || {
@@ -252,6 +280,55 @@ impl App {
             move |(result, leftover)| msg(RemoveMsg::Removed { path: path.clone(), result, leftover }),
         );
         Task::batch([removed, self.after_select()])
+    }
+
+    /// git is done with the worktree at `path`: it is gone, or the Worktrees
+    /// dialog says why not on its row (a banner does when the dialog is closed).
+    fn removed(&mut self, path: PathBuf, result: Result<(), String>, leftover: bool) -> Task<Message> {
+        let Some(i) = self.removals.iter().position(|r| r.path == path) else { return Task::none() };
+        let common_dir = self.removals[i].common_dir.clone();
+        match result {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "worktree removed");
+                self.removals.remove(i);
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, leftover, "removing a worktree failed");
+                let banner = self.worktrees_of(&common_dir).is_none().then(|| {
+                    let name =
+                        path.file_name().map_or_else(|| display_dir(&path), |n| n.to_string_lossy().into_owned());
+                    if leftover {
+                        format!("The worktree {name} is gone from git, but part of its folder is left: {e}")
+                    } else {
+                        format!("git did not remove the worktree {name}: {e}")
+                    }
+                });
+                if banner.is_some() {
+                    self.error.clone_from(&banner);
+                }
+                let r = &mut self.removals[i];
+                r.failed = Some(e);
+                r.leftover = leftover;
+                r.banner = banner;
+            }
+        }
+        Task::batch([self.reload_worktrees(&common_dir), self.read_git()])
+    }
+
+    /// Brings the failed removals of a repository in line with git's list
+    /// of its worktrees: one whose folder is gone meanwhile is dropped, one
+    /// git no longer lists is left over, one it still lists is not.
+    pub(crate) fn settle_removals(&mut self, common_dir: &Path, listed: &[PathBuf]) {
+        self.removals.retain_mut(|r| {
+            if r.failed.is_none() || !git::same_path(&r.common_dir, common_dir) {
+                return true;
+            }
+            if !r.path.exists() {
+                return false;
+            }
+            r.leftover = !listed.iter().any(|p| git::same_path(p, &r.path));
+            true
+        });
     }
 
     pub(crate) fn view_remove<'a>(&'a self, f: &'a RemoveForm) -> DialogParts<'a> {
@@ -290,12 +367,10 @@ impl App {
             .collect();
         let this_one = if f.sessions.contains(&f.back.tab) { ", this one included" } else { "" };
         col = col.push(
-            text(match (names.len(), f.closed) {
-                (0, 0) => "No session works there.".to_owned(),
-                (0, 1) => "Its session is closed.".to_owned(),
-                (0, n) => format!("Its {n} sessions are closed."),
-                (1, _) => format!("It closes the session working there{this_one}: {}.", names[0]),
-                (n, _) => format!("It closes the {n} sessions working there{this_one}: {}.", names.join(", ")),
+            text(match names.len() {
+                0 => "No session works there.".to_owned(),
+                1 => format!("It closes the session working there{this_one}: {}.", names[0]),
+                n => format!("It closes the {n} sessions working there{this_one}: {}.", names.join(", ")),
             })
             .size(13),
         );
@@ -360,17 +435,10 @@ impl App {
             ));
         }
 
-        let back = ui::secondary("Back");
-        let label = match (f.removing, f.leftover) {
-            (true, _) => "Removing…",
-            (false, true) => "Delete the rest",
-            (false, false) => "Remove worktree",
-        };
-        let mut parts = DialogParts::new("Remove worktree?", col)
-            .button(if f.removing { back } else { back.on_press(Message::DialogCancel) })
-            .button(ui::danger(label).on_press_maybe(f.can_remove().then(|| msg(RemoveMsg::Confirm))));
-        parts.closable = !f.removing;
-        parts
+        let label = if f.leftover { "Delete the rest" } else { "Remove worktree" };
+        DialogParts::new("Remove worktree?", col)
+            .button(ui::secondary("Back").on_press(Message::DialogCancel))
+            .button(ui::danger(label).on_press_maybe(f.can_remove().then(|| msg(RemoveMsg::Confirm))))
     }
 }
 

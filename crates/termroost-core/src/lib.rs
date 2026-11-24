@@ -22,6 +22,7 @@ pub mod error;
 pub mod git;
 pub mod host;
 pub mod layout;
+pub mod lsp;
 pub mod model;
 pub mod paths;
 pub mod session;

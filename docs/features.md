@@ -29,12 +29,26 @@ An SVG can be edited: **Edit as text** under it opens its text (in Neovim, if fi
 
 ### Neovim
 
-In **Settings → Editor**, *Edit files with: Neovim or Vim* opens files in Neovim (or Vim, if there is no Neovim) running in a terminal in the same place, with your own configuration. Quitting it (`:q`) closes the file. Neovim hears when you look at it and when you look away, so with `autoread` it picks up changes agents make. A different editor command can be set there; the file's path is added at the end. Ctrl+Shift shortcuts and Alt+arrows stay with Terminal Rooster.
+In **Settings → Editor**, *Edit files with: Neovim or Vim* opens files in Neovim (or Vim, if there is no Neovim) running in a terminal in the same place, with [Terminal Rooster's setup](#language-support-in-neovim) or your own configuration. Quitting it (`:q`) closes the file. Neovim hears when you look at it and when you look away, so with `autoread` it picks up changes agents make. A different editor command can be set there; the file's path is added at the end. Ctrl+Shift shortcuts and Alt+arrows stay with Terminal Rooster.
 
 Closing the file quits Neovim or Vim as `:qa` would, without asking: with changes not saved it stays open and says so (in the background, it comes to the front). Another editor is ended. Quitting Terminal Rooster asks first.
 
 - **Getting Neovim on Windows:** without a Neovim on PATH, **Settings → Editor → Neovim → Install and use** downloads a pinned Neovim release (the official zip), checks its SHA-256 and unpacks it with Windows' own `tar.exe` into `%LOCALAPPDATA%\TerminalRooster\data\nvim`, like [the bash download](installing.md#bash-on-windows). Nothing outside that folder changes; delete it to remove it. A Neovim of your own on PATH is used first.
 - **On Linux**, install Neovim with your package manager (`sudo apt install neovim`, `sudo dnf install neovim`, `sudo pacman -S neovim`); Settings says so when it finds none.
+
+### Language support in Neovim
+
+Neovim found by Terminal Rooster runs with Terminal Rooster's own `init.lua` (`nvim -u`), which starts language servers: completion as you type, errors and warnings next to the code, hover (`K`), go to definition (`gd`), rename (`grn`), code actions (`gra`) and references (`grr`). It is on unless you have a configuration of your own (`init.lua` or `init.vim`); **Settings → Editor → Terminal Rooster's Neovim setup** switches it. A set editor command always runs with your own configuration.
+
+| Languages | Server | Installed with |
+| --- | --- | --- |
+| Rust | rust-analyzer, checking with Clippy | rustup |
+| C# | Roslyn (`roslyn-language-server`), which finds the solution or projects itself | `dotnet tool` (.NET 10 SDK) |
+| JavaScript, TypeScript, React | TypeScript 7 (`tsc --lsp`) | npm |
+| HTML, CSS, JSON; ESLint | VS Code's servers (`vscode-langservers-extracted`) | npm (runs on Node.js 18+) |
+| Tailwind CSS | Tailwind CSS IntelliSense | npm (runs on Node.js 18+) |
+
+Servers are installed into `%LOCALAPPDATA%\TerminalRooster\data\lsp` (the local data directory elsewhere) with the computer's own npm, dotnet and rustup; Node.js, .NET and Rust aren't installed for you, and a language says what it needs when they're missing. Opening a file whose language has no server yet offers to install it under the file (**Install** / **Not now**); **Settings → Languages → Install all** installs every language's server, and later ones and updates, without asking. A server installed while Neovim is open starts in it. ESLint starts in projects with an ESLint configuration, Tailwind in projects that use Tailwind. Visual Basic has Neovim's highlighting only: Roslyn's published server doesn't load VB projects.
 
 ## Tasks
 

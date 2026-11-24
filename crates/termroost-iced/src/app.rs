@@ -33,7 +33,7 @@ use crate::theme;
 use crate::themes::{self, ColorField, Hex, ThemeDef, ThemeStore};
 use crate::ui;
 use crate::worktree::{WorktreeForm, WorktreeMsg};
-use crate::worktree_remove::{RemoveForm, RemoveMsg};
+use crate::worktree_remove::{Removal, RemoveForm, RemoveMsg};
 
 /// How often the branches of the visible sessions, and the git log when it
 /// shows, are checked again.
@@ -209,7 +209,9 @@ pub enum Dialog {
     RemoveWorktree(Box<RemoveForm>),
     /// Add remotes to the Git tab's repository, or change their URLs.
     Remotes(Box<RemotesForm>),
-    /// Quitting while terminals still run programs, or files have unsaved changes.
+    /// Quitting while terminals still run programs, files have unsaved
+    /// changes, or git is still removing a worktree (`App::removals`, shown
+    /// as they are now).
     ConfirmQuit {
         running: Vec<RunningTerminal>,
         /// Files with unsaved changes ("src/main.rs (agents)").
@@ -523,6 +525,8 @@ pub struct App {
     git_polling: bool,
     /// Session folders deleted outside the app (see `gone_folders`).
     pub(crate) gone: HashSet<PathBuf>,
+    /// Worktrees git is removing in the background, and ones it failed to.
+    pub(crate) removals: Vec<Removal>,
     /// The log in the side panel's Git tab.
     pub(crate) git_log: Option<GitLog>,
     /// The Git tab's last pull, push or change of remote.
@@ -637,6 +641,7 @@ impl App {
             git: HashMap::new(),
             git_polling: false,
             gone: HashSet::new(),
+            removals: Vec::new(),
             git_log: None,
             git_sync: None,
             log_reading: false,
@@ -1082,8 +1087,10 @@ impl App {
                 if matches!(self.dialog, Some(Dialog::ConfirmQuit { .. })) {
                     return Task::none();
                 }
-                // Unsaved files are always asked about; running programs as the user chose.
+                // Unsaved files and worktrees being removed are always asked
+                // about; running programs as the user chose.
                 let unsaved = self.unsaved_files();
+                let removing = !self.removing_worktrees().is_empty();
                 let running = if self.prefs.confirm_quit {
                     // Terminals under helpers go on running.
                     let s = self.core.state();
@@ -1094,7 +1101,7 @@ impl App {
                 } else {
                     Vec::new()
                 };
-                if !running.is_empty() || !unsaved.is_empty() {
+                if !running.is_empty() || !unsaved.is_empty() || removing {
                     self.rename = None;
                     self.dialog = Some(Dialog::ConfirmQuit { running, unsaved, dont_ask: false });
                     return Task::none();
@@ -1596,7 +1603,6 @@ impl App {
                 match &self.dialog {
                     // git is making the worktree; the result moves the session.
                     Some(Dialog::Worktree(f)) if f.creating => return Task::none(),
-                    Some(Dialog::RemoveWorktree(f)) if f.removing => return Task::none(),
                     Some(Dialog::Remotes(f)) if f.busy.is_some() => return Task::none(),
                     Some(Dialog::RemoveWorktree(_)) => {
                         self.cancel_remove();

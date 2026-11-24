@@ -204,6 +204,11 @@ impl App {
             }
             Dialog::ConfirmQuit { running, unsaved, dont_ask } => {
                 let mut col = column![].spacing(14);
+                let removing = self.removing_worktrees();
+                if running.is_empty() && unsaved.is_empty() && removing.is_empty() {
+                    // It was asked only for worktrees, and git is done with them.
+                    col = col.push(para("Nothing is being removed any more."));
+                }
                 if !unsaved.is_empty() {
                     let n = unsaved.len();
                     let list = bullets(unsaved.iter().map(|f| para(f).into()));
@@ -214,6 +219,21 @@ impl App {
                             format!("{n} files have unsaved changes. Quitting loses them.")
                         }))
                         .push(container(ui::scroll(list)).max_height(200));
+                }
+                if !removing.is_empty() {
+                    let n = removing.len();
+                    let list = bullets(removing.into_iter().map(|d| para(d).into()));
+                    col = col
+                        .push(para(if n == 1 {
+                            "A worktree is still being removed. Quitting now can leave it, or part of its folder."
+                                .to_owned()
+                        } else {
+                            format!(
+                                "{n} worktrees are still being removed. Quitting now can leave them, or parts of \
+                                 their folders."
+                            )
+                        }))
+                        .push(container(ui::scroll(list)).max_height(120));
                 }
                 if !running.is_empty() {
                     let n = running.len();

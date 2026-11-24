@@ -443,14 +443,19 @@ impl App {
         Some(self.focus_active())
     }
 
-    /// Closes the files of a session that is going away, ending their terminal editors.
-    pub(crate) fn drop_session_files(&mut self, tab: TabId) {
+    /// Closes the files of a session that is going away, ending their terminal
+    /// editors. Returns the editors' process ids, to wait for when their
+    /// folder is being deleted.
+    pub(crate) fn drop_session_files(&mut self, tab: TabId) -> Vec<u32> {
         self.open_files_dirty = true;
+        let mut ended = Vec::new();
         for doc in self.editors.remove(&tab).map(|f| f.open).unwrap_or_default() {
             if let DocKind::Terminal { handle, .. } = doc.kind {
+                ended.extend(handle.shell_pid());
                 self.core.close_scratch_terminal(handle.pane());
             }
         }
+        ended
     }
 
     /// Files with unsaved changes, named for the quit dialog: "src/main.rs (agents)".

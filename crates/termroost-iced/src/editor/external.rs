@@ -18,18 +18,23 @@ pub struct Launch {
 /// (`setting`, its program looked up with `lookup` unless it is a full
 /// path), or the editor `detect` finds when it is empty; with the file's
 /// path last, relative to `root` (the session's folder, where the editor
-/// starts) when it is inside it.
+/// starts) when it is inside it. A Neovim found that way runs with the
+/// `init.lua` of Terminal Rooster's setup, when `setup` gives one.
 pub fn launch(
     setting: &str,
     file: &Path,
     root: &Path,
     detect: impl FnOnce() -> Option<EditorProgram>,
     lookup: impl Fn(&str) -> Option<PathBuf>,
+    setup: impl FnOnce() -> Option<PathBuf>,
 ) -> Result<Launch, String> {
     let (editor, mut args) = match shell::split_command_line(setting) {
         None => {
             let found = detect().ok_or("no Neovim or Vim was found: install Neovim, or set the editor command")?;
-            (found, Vec::new())
+            let neovim = found.program.file_stem().is_some_and(|s| s.eq_ignore_ascii_case("nvim"));
+            let init = neovim.then(setup).flatten();
+            let args = init.map(|i| vec!["-u".to_owned(), i.display().to_string()]).unwrap_or_default();
+            (found, args)
         }
         Some(ShellCommand { program, args }) => {
             let path = if Path::new(&program).is_absolute() {
@@ -66,9 +71,14 @@ pub fn quit_keys(name: &str) -> Option<&'static [u8]> {
 }
 
 /// [`launch`] with the editor and `PATH` of this machine.
-pub fn launch_here(setting: &str, file: &Path, root: &Path) -> Result<Launch, String> {
+pub fn launch_here(
+    setting: &str,
+    file: &Path,
+    root: &Path,
+    setup: impl FnOnce() -> Option<PathBuf>,
+) -> Result<Launch, String> {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    launch(setting, file, root, shell::find_terminal_editor, |name| shell::find_program(name, &path))
+    launch(setting, file, root, shell::find_terminal_editor, |name| shell::find_program(name, &path), setup)
 }
 
 #[cfg(test)]
@@ -83,25 +93,43 @@ mod tests {
         (name == "hx").then(|| PathBuf::from("/usr/bin/hx"))
     }
 
+    fn no_setup() -> Option<PathBuf> {
+        None
+    }
+
+    #[test]
+    fn a_found_neovim_runs_with_the_setup() {
+        let root = Path::new("/w");
+        let init = || Some(PathBuf::from("/data/nvim-setup/init.lua"));
+        let l = launch("", &root.join("main.rs"), root, nvim, lookup, init).unwrap();
+        let init_arg = Path::new("/data/nvim-setup/init.lua").display().to_string();
+        assert_eq!(l.command.args, ["-u", init_arg.as_str(), "main.rs"]);
+        let vim = || Some(EditorProgram { program: PathBuf::from("/usr/bin/vim"), env: Vec::new() });
+        assert_eq!(launch("", &root.join("main.rs"), root, vim, lookup, init).unwrap().command.args, ["main.rs"]);
+        let on_path = |n: &str| (n == "nvim").then(|| PathBuf::from("/opt/nvim/bin/nvim"));
+        let own = launch("nvim", &root.join("main.rs"), root, nvim, on_path, init).unwrap();
+        assert_eq!(own.command.args, ["main.rs"], "a command the user set runs as it is");
+    }
+
     #[test]
     fn the_detected_editor_opens_the_file_by_its_path_in_the_session() {
         let root = Path::new("/w/app");
-        let l = launch("", &root.join("src").join("main.rs"), root, nvim, lookup).unwrap();
+        let l = launch("", &root.join("src").join("main.rs"), root, nvim, lookup, no_setup).unwrap();
         assert_eq!(l.command.program, PathBuf::from("/opt/nvim/bin/nvim").display().to_string());
         assert_eq!(l.command.args, ["src/main.rs"]);
         assert_eq!(l.name, "nvim");
-        let outside = launch("", Path::new("/etc/hosts"), root, nvim, lookup).unwrap();
+        let outside = launch("", Path::new("/etc/hosts"), root, nvim, lookup, no_setup).unwrap();
         assert_eq!(outside.command.args, [Path::new("/etc/hosts").display().to_string()]);
     }
 
     #[test]
     fn a_set_command_keeps_its_arguments() {
         let root = Path::new("/w");
-        let l = launch("hx --vsplit", &root.join("a b.txt"), root, || None, lookup).unwrap();
+        let l = launch("hx --vsplit", &root.join("a b.txt"), root, || None, lookup, no_setup).unwrap();
         assert_eq!(l.command.program, PathBuf::from("/usr/bin/hx").display().to_string());
         assert_eq!(l.command.args, ["--vsplit", "a b.txt"]);
-        assert!(launch("emacs", &root.join("x"), root, nvim, lookup).unwrap_err().contains("emacs"));
-        assert!(launch("", &root.join("x"), root, || None, lookup).unwrap_err().contains("Neovim"));
+        assert!(launch("emacs", &root.join("x"), root, nvim, lookup, no_setup).unwrap_err().contains("emacs"));
+        assert!(launch("", &root.join("x"), root, || None, lookup, no_setup).unwrap_err().contains("Neovim"));
     }
 
     #[test]
@@ -115,7 +143,9 @@ mod tests {
     #[test]
     fn a_full_path_is_used_as_it_is() {
         let vim = r"C:\Program Files\Git\usr\bin\vim.exe";
-        let l = launch(&format!("\"{vim}\""), Path::new(r"C:\w\x.txt"), Path::new(r"C:\w"), || None, |_| None).unwrap();
+        let l =
+            launch(&format!("\"{vim}\""), Path::new(r"C:\w\x.txt"), Path::new(r"C:\w"), || None, |_| None, no_setup)
+                .unwrap();
         assert_eq!(l.command.program, vim);
         assert_eq!(l.command.args, ["x.txt"]);
         assert_eq!(l.env, [("TERM".to_owned(), "xterm-256color".to_owned())], "MSYS Vim");

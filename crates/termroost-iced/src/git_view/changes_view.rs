@@ -34,6 +34,7 @@ fn verb(section: Section) -> &'static str {
         Section::Conflicts => "Mark resolved",
         Section::Staged => "Unstage",
         Section::Unstaged | Section::Untracked => "Stage",
+        Section::Ignored => "Stop ignoring",
     }
 }
 
@@ -119,35 +120,40 @@ impl App {
     /// The sections of the changes and their files, scrolled, under a bar
     /// that folds or unfolds every file.
     fn view_sections<'a>(&'a self, doc: DocId, c: &'a ChangesDoc, changes: &'a WorkingChanges) -> Element<'a, Message> {
-        let mut page = column![].spacing(12);
-        let mut empty = true;
+        let mut page: Vec<Element<'a, Message>> = Vec::new();
+        // Whether there is anything to commit (or not to), ignored or not.
+        let (mut to_commit, mut empty) = (false, true);
         for section in Section::ALL {
             let files: Vec<&FileDiff> = section.files(changes).collect();
             if files.is_empty() {
                 continue;
             }
             empty = false;
+            to_commit |= section != Section::Ignored;
             let folded = c.section_folded(section);
-            page = page.push(section_header(doc, section, files.len(), folded, c.busy));
+            page.push(section_header(doc, section, files.len(), folded, c.busy));
             if folded {
                 continue;
             }
             for file in files.iter().take(MAX_FILES) {
-                page = page.push(self.changed_file(doc, c, section, file, files.len()));
+                page.push(self.changed_file(doc, c, section, file, files.len()));
             }
             if files.len() > MAX_FILES {
                 let more = format!("{} more files are not shown.", files.len() - MAX_FILES);
-                page = page.push(container(muted_text(more).size(theme::TEXT_SM)).padding([0, 4]));
+                page.push(container(muted_text(more).size(theme::TEXT_SM)).padding([0, 4]).into());
             }
         }
-        if empty {
-            let what = if changes.unborn {
+        if !to_commit {
+            let what = if !empty {
+                "Nothing to commit but the ignored changes."
+            } else if changes.unborn {
                 "Nothing to commit yet: add some files to the folder."
             } else {
                 "Nothing to commit: the files are as the last commit left them."
             };
-            page = page.push(container(text(what).size(theme::TEXT).style(ui::muted)).padding([8, 4]));
+            page.insert(0, container(text(what).size(theme::TEXT).style(ui::muted)).padding([8, 4]).into());
         }
+        let page = column(page).spacing(12);
         let list = ui::scroll(container(page).padding(Padding { top: 0.0, right: 14.0, bottom: 12.0, left: 4.0 }))
             .id(CHANGES_SCROLL)
             .height(Length::Fill);
@@ -159,7 +165,8 @@ impl App {
 
     /// A file of a section: its header with a button for the whole file,
     /// and unless folded its hunks, each with a button of its own (when
-    /// hunks can be staged one by one).
+    /// hunks can be staged one by one). An unstaged file can be ignored, and
+    /// one whose change was ignored before is marked.
     fn changed_file<'a>(
         &'a self,
         doc: DocId,
@@ -170,22 +177,43 @@ impl App {
     ) -> Element<'a, Message> {
         let busy = c.busy;
         let pick = |p: Pick| (!busy).then_some(Message::GitView(GitViewMsg::Move(doc, p)));
+        let unless_busy = |m: GitViewMsg| (!busy).then_some(Message::GitView(m));
+        let was_ignored = matches!(&c.changes, Some(Ok(w)) if w.was_ignored.contains(&file.path))
+            && matches!(section, Section::Staged | Section::Unstaged);
         let mut actions = Row::new();
+        if was_ignored {
+            actions = actions.push(tip(
+                ui::badge("Was ignored", Tone::Warning),
+                "Changed since it was ignored",
+                tooltip::Position::Top,
+            ));
+            let forget = Message::GitView(GitViewMsg::Unignore(doc, file.path.clone()));
+            actions = actions.push(icon_button(Icon::Close, forget, "Forget it was ignored"));
+        }
         if file.status != FileStatus::Deleted {
             let path = c.repo.worktree.join(&file.path);
             actions = actions.push(icon_button(Icon::Open, Message::Files(FilesMsg::Open(path)), "Open the file"));
         }
-        let whole = ui::small(verb(section), theme::button_secondary)
-            .padding([2, 10])
-            .on_press_maybe(pick(Pick::File(section, file.path.clone())));
-        actions = actions.push(whole);
+        if section == Section::Unstaged && file.fingerprint().is_some() {
+            let ignore = ui::small(if was_ignored { "Ignore again" } else { "Ignore" }, theme::button_ghost)
+                .padding([2, 10])
+                .on_press_maybe(unless_busy(GitViewMsg::Ignore(doc, file.path.clone())));
+            actions = actions.push(tip(ignore, "Leave out of Stage all until it changes", tooltip::Position::Top));
+        }
+        let press = match section {
+            Section::Ignored => unless_busy(GitViewMsg::Unignore(doc, file.path.clone())),
+            _ => pick(Pick::File(section, file.path.clone())),
+        };
+        actions =
+            actions.push(ui::small(verb(section), theme::button_secondary).padding([2, 10]).on_press_maybe(press));
         let toggle = Message::GitView(GitViewMsg::ToggleChange(doc, section, file.path.clone()));
         let folded = c.folded(section, file, in_section);
         let mut block = column![file_header(file, folded, toggle, actions)];
         if !folded {
             let digits = file_digits(file);
             let font_size = self.prefs.font_size;
-            let splittable = file.splittable();
+            // An ignored change is looked at, not staged bit by bit.
+            let splittable = file.splittable() && section != Section::Ignored;
             let chosen = |i: usize| c.chosen.as_ref().filter(|ch| ch.is(section, &file.path, i)).map(|ch| &ch.lines);
             let lines = |i: usize, hunk: &'a termroost_core::git::Hunk| {
                 let lines = DiffLines::new(&hunk.lines, digits, font_size);
@@ -266,12 +294,13 @@ fn fold_bar<'a>(doc: DocId, c: &ChangesDoc, changes: &WorkingChanges) -> Element
 }
 
 /// A section's title and how many files it has, with a button for all of
-/// them. Pressed, the title folds or unfolds the section.
+/// them (but ignored ones). Pressed, the title folds or unfolds the section.
 fn section_header<'a>(doc: DocId, section: Section, files: usize, folded: bool, busy: bool) -> Element<'a, Message> {
     let all = match section {
-        Section::Staged => "Unstage all",
-        Section::Conflicts => "Mark all resolved",
-        Section::Unstaged | Section::Untracked => "Stage all",
+        Section::Staged => Some("Unstage all"),
+        Section::Conflicts => Some("Mark all resolved"),
+        Section::Unstaged | Section::Untracked => Some("Stage all"),
+        Section::Ignored => None,
     };
     let press = (!busy).then_some(Message::GitView(GitViewMsg::Move(doc, Pick::All(section))));
     let tone = if section == Section::Conflicts { Tone::Warning } else { Tone::Neutral };
@@ -285,7 +314,11 @@ fn section_header<'a>(doc: DocId, section: Section, files: usize, folded: bool, 
         .style(theme::button_bare)
         .on_press(Message::GitView(GitViewMsg::ToggleSection(doc, section)))
         .width(Length::Fill);
-    row![toggle, ui::small(all, theme::button_secondary).on_press_maybe(press)]
+    let mut header = row![toggle];
+    if let Some(all) = all {
+        header = header.push(ui::small(all, theme::button_secondary).on_press_maybe(press));
+    }
+    header
         .spacing(8)
         .padding(Padding { top: 6.0, right: 0.0, bottom: 0.0, left: 4.0 })
         .align_y(Alignment::Center)

@@ -84,7 +84,12 @@ pub enum GitViewMsg {
     FoldAll(DocId, bool),
     /// Stage what is picked, or unstage it when it is staged.
     Move(DocId, Pick),
-    /// It was staged or unstaged (or why not), and the changes read again.
+    /// Ignore the unstaged change of a file (by path), as shown.
+    Ignore(DocId, String),
+    /// Stop ignoring a file's change, or marking it as ignored before.
+    Unignore(DocId, String),
+    /// It was staged, unstaged or ignored (or why not), and the changes read
+    /// again.
     Moved(DocId, u64, Result<(), String>, Box<Result<WorkingChanges, String>>),
     /// A line of a hunk was pressed (section, path, hunk, line, keys held).
     ChooseLine(DocId, Section, String, usize, usize, iced::keyboard::Modifiers),

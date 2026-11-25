@@ -617,6 +617,7 @@ mod tests {
             binary: false,
             large: false,
             mode: None,
+            blobs: Some(("1111111".into(), "2222222".into())),
             hunks: vec![hunk],
             lossy: false,
         };

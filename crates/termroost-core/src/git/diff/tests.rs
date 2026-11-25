@@ -43,6 +43,8 @@ fn parses_hunks_and_numbers_their_lines() {
     assert_eq!(h.lines[2], line(LineKind::Removed, "-- a removed line that looks like a header", Some(11), None));
     assert_eq!(f.counts(), (2, 2));
     assert!(f.splittable());
+    assert_eq!(f.blobs, Some(("1111111".into(), "2222222".into())));
+    assert_eq!(f.fingerprint().as_deref(), Some("1111111..2222222"));
 }
 
 #[test]
@@ -114,7 +116,11 @@ fn parses_every_kind_of_file() {
     assert!(files[3].hunks.is_empty() && !files[3].splittable());
     assert!(files[4].binary && !files[4].splittable());
     assert_eq!(files[5].mode, Some(("100644".into(), "100755".into())));
+    // A change of mode alone has no blobs: the modes tell it.
+    assert_eq!(files[5].fingerprint().as_deref(), Some("100644->100755"));
+    assert_eq!(files[0].blobs, Some(("0000000".into(), "814f4a4".into())));
     assert!(files[7].hunks.is_empty());
+    assert_eq!(files[7].blobs, None, "not a conflict's three blobs");
     assert!(!files[0].splittable() && !files[1].splittable(), "new and deleted files go whole");
 }
 

@@ -15,6 +15,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
 
+use super::ignored::set_aside;
 use super::{Repo, command, git, spawn_error};
 
 /// How a file changed.
@@ -199,10 +200,17 @@ pub struct CommitDetails {
 pub struct WorkingChanges {
     /// Staged: the index against HEAD.
     pub staged: Vec<FileDiff>,
-    /// Not staged: the working tree against the index, conflicts included.
+    /// Not staged: the working tree against the index, conflicts included,
+    /// ignored changes not.
     pub unstaged: Vec<FileDiff>,
     /// Files git doesn't track yet; the first few have their text read.
     pub untracked: Vec<FileDiff>,
+    /// Changes not staged that the user ignored, exactly as they are (see
+    /// [`Repo::ignore_change`]).
+    pub ignored: Vec<FileDiff>,
+    /// Paths of staged or unstaged files whose change was ignored, and has
+    /// changed since (or was staged): no longer ignored.
+    pub was_ignored: BTreeSet<String>,
     /// HEAD has no commit yet (a new repository): a commit would be the first.
     pub unborn: bool,
 }
@@ -271,7 +279,10 @@ impl Repo {
             .enumerate()
             .map(|(i, path)| untracked_file(&self.worktree, path, i < UNTRACKED_READ))
             .collect();
-        Ok(WorkingChanges { staged, unstaged, untracked, unborn: self.head_commit_id().is_none() })
+        let unborn = self.head_commit_id().is_none();
+        let mut changes = WorkingChanges { staged, unstaged, untracked, unborn, ..WorkingChanges::default() };
+        set_aside(&mut changes, &self.ignored()?);
+        Ok(changes)
     }
 
     /// Stages these files whole, as they are in the working tree: changed,
@@ -762,4 +773,4 @@ fn failure(args: &[&str], status: std::process::ExitStatus, stdout: &[u8], stder
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

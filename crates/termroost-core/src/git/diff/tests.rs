@@ -233,7 +233,7 @@ fn the_no_newline_mark_goes_with_its_line() {
 
 /// A new repository in a temporary folder with its own identity; `None`
 /// without git.
-fn repo() -> Option<(tempfile::TempDir, Repo)> {
+pub(crate) fn repo() -> Option<(tempfile::TempDir, Repo)> {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("app");
     std::fs::create_dir(&root).unwrap();
@@ -251,13 +251,13 @@ fn repo() -> Option<(tempfile::TempDir, Repo)> {
     Some((dir, repo))
 }
 
-fn write(repo: &Repo, path: &str, text: &str) {
+pub(crate) fn write(repo: &Repo, path: &str, text: &str) {
     let full = repo.worktree.join(path);
     std::fs::create_dir_all(full.parent().unwrap()).unwrap();
     std::fs::write(full, text).unwrap();
 }
 
-fn run(repo: &Repo, args: &[&str]) -> String {
+pub(crate) fn run(repo: &Repo, args: &[&str]) -> String {
     git(&repo.worktree, args).unwrap()
 }
 

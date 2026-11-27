@@ -15,6 +15,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
 
+use super::ignored::set_aside;
 use super::{Repo, command, git, spawn_error};
 
 /// How a file changed.
@@ -62,6 +63,9 @@ pub struct FileDiff {
     pub large: bool,
     /// Its mode changed, such as made executable: (old, new).
     pub mode: Option<(String, String)>,
+    /// The ids of its blobs before and after, whole (git's `index` line).
+    /// None for a conflict, a change of mode alone, or an untracked file.
+    pub blobs: Option<(String, String)>,
     pub hunks: Vec<Hunk>,
     /// Its text is not UTF-8: it shows with replacement characters, and its
     /// hunks can't be staged on their own (the patch would not fit).
@@ -77,9 +81,20 @@ impl FileDiff {
             binary: false,
             large: false,
             mode: None,
+            blobs: None,
             hunks: Vec::new(),
             lossy: false,
         }
+    }
+
+    /// What the change is, exactly: both sides' blobs, and the modes when
+    /// they changed. Changing the file again, or what it is compared with,
+    /// makes another. `None` when git gave neither (an untracked file).
+    pub fn fingerprint(&self) -> Option<String> {
+        let blobs = self.blobs.as_ref().map(|(old, new)| format!("{old}..{new}"));
+        let mode = self.mode.as_ref().map(|(old, new)| format!("{old}->{new}"));
+        let parts: Vec<String> = [blobs, mode].into_iter().flatten().collect();
+        (!parts.is_empty()).then(|| parts.join(" "))
     }
 
     /// Lines added and removed, over all hunks.
@@ -185,10 +200,17 @@ pub struct CommitDetails {
 pub struct WorkingChanges {
     /// Staged: the index against HEAD.
     pub staged: Vec<FileDiff>,
-    /// Not staged: the working tree against the index, conflicts included.
+    /// Not staged: the working tree against the index, conflicts included,
+    /// ignored changes not.
     pub unstaged: Vec<FileDiff>,
     /// Files git doesn't track yet; the first few have their text read.
     pub untracked: Vec<FileDiff>,
+    /// Changes not staged that the user ignored, exactly as they are (see
+    /// [`Repo::ignore_change`]).
+    pub ignored: Vec<FileDiff>,
+    /// Paths of staged or unstaged files whose change was ignored, and has
+    /// changed since (or was staged): no longer ignored.
+    pub was_ignored: BTreeSet<String>,
     /// HEAD has no commit yet (a new repository): a commit would be the first.
     pub unborn: bool,
 }
@@ -203,9 +225,18 @@ const UNTRACKED_MAX_BYTES: u64 = 256 << 10;
 
 /// Options that make git's diffs look the same whatever the user set up:
 /// paths as they are, `a/` and `b/` in front of them, three lines around
-/// every change, no external programs.
-const DIFF_ARGS: [&str; 7] =
-    ["--no-color", "--no-ext-diff", "--no-relative", "--src-prefix=a/", "--dst-prefix=b/", "-U3", "--no-textconv"];
+/// every change, no external programs, and whole blob ids (abbreviated ones
+/// grow with the repository, and would change a change's fingerprint).
+const DIFF_ARGS: [&str; 8] = [
+    "--no-color",
+    "--no-ext-diff",
+    "--no-relative",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "-U3",
+    "--no-textconv",
+    "--full-index",
+];
 
 impl Repo {
     /// The commit `id` (anything `git show` takes), its message and what it
@@ -248,7 +279,10 @@ impl Repo {
             .enumerate()
             .map(|(i, path)| untracked_file(&self.worktree, path, i < UNTRACKED_READ))
             .collect();
-        Ok(WorkingChanges { staged, unstaged, untracked, unborn: self.head_commit_id().is_none() })
+        let unborn = self.head_commit_id().is_none();
+        let mut changes = WorkingChanges { staged, unstaged, untracked, unborn, ..WorkingChanges::default() };
+        set_aside(&mut changes, &self.ignored()?);
+        Ok(changes)
     }
 
     /// Stages these files whole, as they are in the working tree: changed,
@@ -630,6 +664,10 @@ fn parse_file(chunk: &[u8]) -> Option<FileDiff> {
             old_mode = Some(m.to_owned());
         } else if let Some(m) = line.strip_prefix("new mode ") {
             file.mode = Some((old_mode.take().unwrap_or_default(), m.to_owned()));
+        } else if let Some(rest) = line.strip_prefix("index ") {
+            // `<old>..<new>`, then the mode when it is the same on both sides.
+            let ids = rest.split_whitespace().next().unwrap_or_default();
+            file.blobs = ids.split_once("..").map(|(old, new)| (old.to_owned(), new.to_owned()));
         } else if let Some(p) = line.strip_prefix("rename from ") {
             old_path = Some(unquote_path(p));
             file.status = FileStatus::Renamed;
@@ -735,4 +773,4 @@ fn failure(args: &[&str], status: std::process::ExitStatus, stdout: &[u8], stder
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

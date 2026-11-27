@@ -1,6 +1,6 @@
 //! Terminal sessions and the background autosave/agent-detection thread.
 
-mod bundle;
+pub(crate) mod bundle;
 pub mod bundled_bash;
 pub mod bundled_nvim;
 pub mod input;

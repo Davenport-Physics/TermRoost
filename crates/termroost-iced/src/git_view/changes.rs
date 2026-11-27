@@ -34,12 +34,16 @@ pub enum Section {
     Unstaged,
     /// Files git doesn't track yet.
     Untracked,
+    /// Changes not staged that the user ignored: never staged with the rest.
+    Ignored,
 }
 
 impl Section {
     /// In the order shown: conflicts first, as they stop a commit, then what
-    /// the next commit takes, under its message, then what it doesn't yet.
-    pub const ALL: [Section; 4] = [Section::Conflicts, Section::Staged, Section::Unstaged, Section::Untracked];
+    /// the next commit takes, under its message, then what it doesn't yet,
+    /// and last what it never will.
+    pub const ALL: [Section; 5] =
+        [Section::Conflicts, Section::Staged, Section::Unstaged, Section::Untracked, Section::Ignored];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -47,6 +51,7 @@ impl Section {
             Section::Unstaged => "Unstaged changes",
             Section::Untracked => "Untracked files",
             Section::Staged => "Staged changes",
+            Section::Ignored => "Ignored changes",
         }
     }
 
@@ -58,6 +63,7 @@ impl Section {
             Section::Unstaged => Box::new(changes.unstaged.iter().filter(move |f| !conflict(f))),
             Section::Untracked => Box::new(changes.untracked.iter()),
             Section::Staged => Box::new(changes.staged.iter()),
+            Section::Ignored => Box::new(changes.ignored.iter()),
         }
     }
 }
@@ -104,6 +110,15 @@ impl Chosen {
 /// The hunk `hunk` of file `path` in `section`, as `changes` has it.
 fn find_hunk<'a>(changes: &'a WorkingChanges, section: Section, path: &str, hunk: usize) -> Option<&'a Hunk> {
     section.files(changes).find(|f| f.path == path && f.splittable())?.hunks.get(hunk)
+}
+
+/// Files marked as ignored before that a commit takes whole (marked under
+/// its message, too): that is settled, and once committed nothing is left
+/// to mark. A file with some of it left unstaged stays marked.
+fn settled_by_commit(changes: &WorkingChanges) -> Vec<String> {
+    let unstaged = |p: &String| changes.unstaged.iter().any(|f| &f.path == p);
+    let staged = changes.staged.iter().map(|f| &f.path);
+    staged.filter(|p| changes.was_ignored.contains(*p) && !unstaged(p)).cloned().collect()
 }
 
 /// The changed lines of `hunk` from `a` to `b`, either way round.
@@ -182,10 +197,11 @@ impl ChangesDoc {
     /// Whether a file shows only its header. Staged files start folded: a
     /// list of what the next commit takes, under its message, which grows
     /// by a line (not a whole diff) for each file staged further down.
+    /// Ignored ones do too, being out of the way.
     pub fn folded(&self, section: Section, file: &FileDiff, files_in_section: usize) -> bool {
         let starts = self.all_folded.unwrap_or_else(|| {
             starts_folded(file)
-                || section == Section::Staged
+                || matches!(section, Section::Staged | Section::Ignored)
                 || (section == Section::Untracked && files_in_section > FOLD_UNTRACKED)
         });
         starts != self.toggled.contains(&(section, file.path.clone()))
@@ -377,10 +393,11 @@ impl App {
     fn move_pick(&mut self, doc: DocId, pick: Pick) -> Task<Message> {
         let Some(c) = self.changes_doc_mut(doc) else { return Task::none() };
         let Some(Ok(changes)) = &c.changes else { return Task::none() };
-        if c.busy {
+        let section = pick.section();
+        // Ignored changes are only staged once they are not ignored.
+        if c.busy || section == Section::Ignored {
             return Task::none();
         }
-        let section = pick.section();
         let unstage = section == Section::Staged;
         // What the user saw: the hunk is applied as it was shown.
         let files: Vec<FileDiff> = match &pick {
@@ -426,6 +443,46 @@ impl App {
         )
     }
 
+    /// Ignores the change of file `path` of the unstaged changes, as it was
+    /// shown; or (`ignore` false) stops ignoring it, or marking it as ignored
+    /// before. On a thread, then the changes are read again there.
+    fn set_ignored(&mut self, doc: DocId, path: String, ignore: bool) -> Task<Message> {
+        let Some(c) = self.changes_doc_mut(doc) else { return Task::none() };
+        let Some(Ok(changes)) = &c.changes else { return Task::none() };
+        if c.busy {
+            return Task::none();
+        }
+        let file = if ignore {
+            let Some(f) = Section::Unstaged.files(changes).find(|f| f.path == path) else { return Task::none() };
+            Some(f.clone())
+        } else {
+            None
+        };
+        c.chosen = None;
+        c.busy = true;
+        c.error = None;
+        c.done = None;
+        c.reads += 1;
+        let n = c.reads;
+        let repo = c.repo.clone();
+        tracing::info!(repo = %repo.worktree.display(), ignore, "ignoring a change");
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let done = match &file {
+                Some(file) => repo.ignore_change(file),
+                None => repo.stop_ignoring([path.as_str()]),
+            };
+            let _ = tx.send_blocking((done, repo.working_changes()));
+        });
+        Task::perform(
+            async move {
+                let stopped = || Err("ignoring stopped".to_owned());
+                rx.recv().await.unwrap_or_else(|_| (stopped(), Err("reading the changes stopped".into())))
+            },
+            move |(done, read)| Message::GitView(GitViewMsg::Moved(doc, n, done, Box::new(read))),
+        )
+    }
+
     /// Ticks or unticks Amend. Ticked with no message written, the last
     /// commit's message is read into the box, to be changed or kept.
     fn set_amend(&mut self, doc: DocId, on: bool) -> Task<Message> {
@@ -461,6 +518,10 @@ impl App {
         }
         let message = c.message.text();
         let amend = c.amend;
+        let settled = match &c.changes {
+            Some(Ok(w)) => settled_by_commit(w),
+            _ => Vec::new(),
+        };
         c.busy = true;
         c.committing = true;
         c.error = None;
@@ -473,6 +534,11 @@ impl App {
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let done = repo.commit(&message, amend);
+            if done.is_ok()
+                && let Err(e) = repo.stop_ignoring(settled.iter().map(String::as_str))
+            {
+                tracing::warn!(repo = %repo.worktree.display(), error = %e, "forgetting ignored changes failed");
+            }
             let _ = tx.send_blocking((done, repo.working_changes()));
         });
         Task::perform(
@@ -510,6 +576,8 @@ impl App {
                 return operation::snap_to(CHANGES_SCROLL, RelativeOffset::START);
             }
             GitViewMsg::Move(doc, pick) => return self.move_pick(doc, pick),
+            GitViewMsg::Ignore(doc, path) => return self.set_ignored(doc, path, true),
+            GitViewMsg::Unignore(doc, path) => return self.set_ignored(doc, path, false),
             GitViewMsg::Moved(doc, n, done, read) => {
                 if let Some(c) = self.changes_doc_mut(doc) {
                     c.busy = false;
@@ -617,6 +685,7 @@ mod tests {
             binary: false,
             large: false,
             mode: None,
+            blobs: Some(("1111111".into(), "2222222".into())),
             hunks: vec![hunk],
             lossy: false,
         };
@@ -689,10 +758,25 @@ mod tests {
         let file = &changes.unstaged[0];
         assert!(!d.folded(Section::Unstaged, file, 1));
         assert!(d.folded(Section::Staged, file, 1));
+        assert!(d.folded(Section::Ignored, file, 1));
         // Unfolded by hand, a staged file stays so; the same file unstaged is apart.
         d.toggle_file(Section::Staged, file.path.clone());
         assert!(!d.folded(Section::Staged, file, 1));
         assert!(!d.folded(Section::Unstaged, file, 1));
+    }
+
+    #[test]
+    fn a_commit_settles_files_ignored_before_that_it_takes_whole() {
+        let Some(Ok(mut changes)) = doc().changes else { unreachable!() };
+        let file = changes.unstaged.remove(0);
+        let other = FileDiff { path: "other.txt".into(), ..file.clone() };
+        changes.staged = vec![file.clone(), other];
+        // (Not staged: not committed.)
+        changes.was_ignored = ["f.txt".to_owned(), "unstaged.txt".to_owned()].into();
+        assert_eq!(settled_by_commit(&changes), vec!["f.txt"]);
+        // Some of it is left unstaged: it stays marked.
+        changes.unstaged.push(file);
+        assert!(settled_by_commit(&changes).is_empty());
     }
 
     #[test]

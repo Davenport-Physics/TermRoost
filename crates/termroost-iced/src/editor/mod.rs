@@ -22,7 +22,7 @@ use iced::Task;
 use iced::widget::operation;
 use iced::widget::text_editor::{self, Action, Cursor, Edit, Position};
 use serde::{Deserialize, Serialize};
-use termroost_core::{GridSize, PaneId, TabId, TerminalHandle};
+use termroost_core::{GridSize, PaneId, TabId, TerminalHandle, lsp};
 
 use crate::app::{App, Dialog, Message, RunningTerminal};
 use crate::git_view::{ChangesDoc, CommitDoc};
@@ -100,6 +100,8 @@ pub enum DocKind {
         /// The editor's name, e.g. `nvim`.
         name: String,
         started: Instant,
+        /// What serves the file's languages, in Terminal Rooster's setup.
+        languages: Vec<lsp::Package>,
     },
     /// A commit of the repository at `path`.
     Commit(Box<CommitDoc>),
@@ -336,15 +338,19 @@ impl App {
             }
             return if how == OpenAs::Picture { self.read_picture(id, path) } else { self.read_doc(id, path) };
         }
-        match self.launch_editor(tab, &path) {
-            Some(kind) => {
+        let wanted = match self.launch_editor(tab, &path) {
+            Some((kind, wanted)) => {
                 if let Some(doc) = self.doc_mut(id) {
                     doc.kind = kind;
                 }
+                wanted
             }
-            None => self.close_doc(id),
-        }
-        self.focus_active()
+            None => {
+                self.close_doc(id);
+                Task::none()
+            }
+        };
+        Task::batch([self.focus_active(), wanted])
     }
 
     fn doc(&self, id: DocId) -> Option<(TabId, &OpenFile)> {
@@ -437,14 +443,19 @@ impl App {
         Some(self.focus_active())
     }
 
-    /// Closes the files of a session that is going away, ending their terminal editors.
-    pub(crate) fn drop_session_files(&mut self, tab: TabId) {
+    /// Closes the files of a session that is going away, ending their terminal
+    /// editors. Returns the editors' process ids, to wait for when their
+    /// folder is being deleted.
+    pub(crate) fn drop_session_files(&mut self, tab: TabId) -> Vec<u32> {
         self.open_files_dirty = true;
+        let mut ended = Vec::new();
         for doc in self.editors.remove(&tab).map(|f| f.open).unwrap_or_default() {
             if let DocKind::Terminal { handle, .. } = doc.kind {
+                ended.extend(handle.shell_pid());
                 self.core.close_scratch_terminal(handle.pane());
             }
         }
+        ended
     }
 
     /// Files with unsaved changes, named for the quit dialog: "src/main.rs (agents)".
@@ -500,11 +511,11 @@ impl App {
         // Pictures open in the viewer, whichever editor files open in.
         let picture = picture::kind_of(&path).is_some();
         if self.prefs.file_editor == FileEditor::Terminal && !picture {
-            let Some(kind) = self.launch_editor(tab, &path) else { return Task::none() };
+            let Some((kind, wanted)) = self.launch_editor(tab, &path) else { return Task::none() };
             let files = self.editors.entry(tab).or_default();
             files.open.push(OpenFile { id, path, kind });
             files.shown = Some(id);
-            return self.focus_active();
+            return Task::batch([self.focus_active(), wanted]);
         }
         let files = self.editors.entry(tab).or_default();
         files.open.push(OpenFile { id, path: path.clone(), kind: DocKind::Loading });
@@ -558,11 +569,11 @@ impl App {
         let path = doc.path.clone();
         self.open_files_dirty = true;
         if self.prefs.file_editor == FileEditor::Terminal {
-            let Some(kind) = self.launch_editor(tab, &path) else { return Task::none() };
+            let Some((kind, wanted)) = self.launch_editor(tab, &path) else { return Task::none() };
             if let Some(doc) = self.doc_mut(id) {
                 doc.kind = kind;
             }
-            return self.focus_active();
+            return Task::batch([self.focus_active(), wanted]);
         }
         if let Some(doc) = self.doc_mut(id) {
             doc.kind = DocKind::Loading;
@@ -582,21 +593,51 @@ impl App {
         self.read_picture(id, path)
     }
 
+    /// Whether Neovim runs with Terminal Rooster's setup: as the settings
+    /// say, else unless the user has a configuration of their own.
+    pub(crate) fn nvim_setup_on(&self) -> bool {
+        self.prefs.nvim_setup.unwrap_or_else(|| lsp::nvim::own_config().is_none())
+    }
+
     /// Starts Neovim or Vim (or the editor command set) on `path`, in a
-    /// terminal in session `tab`'s folder. `None`, with a banner saying why,
-    /// when it can't.
-    fn launch_editor(&mut self, tab: TabId, path: &Path) -> Option<DocKind> {
+    /// terminal in session `tab`'s folder, and looks at whether the file's
+    /// languages have support. `None`, with a banner saying why, when it
+    /// can't.
+    fn launch_editor(&mut self, tab: TabId, path: &Path) -> Option<(DocKind, Task<Message>)> {
         let s = self.core.state();
         let root = s.tab(tab).map(|t| s.tab_working_dir(t))?;
-        let launch = match external::launch_here(&self.prefs.editor_command, path, &root) {
+        let use_setup = self.nvim_setup_on();
+        let mut with_setup = false;
+        let setup = || {
+            if !use_setup {
+                return None;
+            }
+            match lsp::nvim::prepare() {
+                Ok(init) => {
+                    with_setup = true;
+                    Some(init)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not write Terminal Rooster's Neovim setup");
+                    None
+                }
+            }
+        };
+        let launch = match external::launch_here(&self.prefs.editor_command, path, &root, setup) {
             Ok(l) => l,
             Err(e) => {
                 self.error = Some(format!("Can't open {} in an editor: {e}.", self.file_label(Some(tab), path)));
                 return None;
             }
         };
+        // Language support is the setup's: Neovim with another configuration
+        // has none of it.
+        let languages = if with_setup { lsp::for_file(path) } else { Vec::new() };
         match self.core.open_program_terminal(&root, launch.command, launch.env, GridSize::default()) {
-            Ok(handle) => Some(DocKind::Terminal { handle, name: launch.name, started: Instant::now() }),
+            Ok(handle) => {
+                let wanted = self.languages_wanted(&languages);
+                Some((DocKind::Terminal { handle, name: launch.name, started: Instant::now(), languages }, wanted))
+            }
             Err(e) => {
                 self.error = Some(format!("Could not start {}: {e}", launch.name));
                 None

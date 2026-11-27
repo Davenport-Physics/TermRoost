@@ -1,12 +1,14 @@
 //! Git awareness for sessions: the branch a directory is on, and working
 //! trees made beside a repository. The `diff` module reads what changed, in
-//! commits and in the working tree, and stages and commits changes.
+//! commits and in the working tree, and stages and commits changes; the
+//! `ignored` module keeps the changes the user ignored out of the way.
 //!
 //! [`Repo::discover`] and [`Repo::head`] only read files under `.git`, so a
 //! front end can poll them for every visible session. Everything else runs
 //! the `git` program.
 
 mod diff;
+mod ignored;
 
 use std::collections::HashSet;
 use std::io::Read;

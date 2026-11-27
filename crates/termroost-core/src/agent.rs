@@ -64,6 +64,35 @@ impl std::fmt::Display for AgentKind {
     }
 }
 
+/// Variables an agent sets for the programs it runs. A terminal that inherits
+/// them believes it runs inside that agent's session.
+const AGENT_ENV_VARS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "ANTIGRAVITY_AGENT",
+    "ANTIGRAVITY_CONVERSATION_ID",
+    "ANTIGRAVITY_TRAJECTORY_ID",
+    "ANTIGRAVITY_LS_ADDRESS",
+    "ANTIGRAVITY_CSRF_TOKEN",
+    "ANTIGRAVITY_SOURCE_METADATA",
+    "ANTIGRAVITY_PROJECT_ID",
+];
+
+/// Removes the agent session variables from this process's environment, so
+/// terminals started from it don't believe they run inside another agent's
+/// session (e.g. when Terminal Rooster itself was launched from one).
+///
+/// # Safety
+///
+/// Changes the process environment (see [`std::env::remove_var`]): call it
+/// before any other thread exists.
+pub unsafe fn clear_agent_env() {
+    for var in AGENT_ENV_VARS {
+        // SAFETY: the caller guarantees no other threads exist.
+        unsafe { std::env::remove_var(var) };
+    }
+}
+
 /// The agent running (or last run) in a pane.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentSession {

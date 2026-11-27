@@ -105,20 +105,8 @@ fn main() -> iced::Result {
         std::process::exit(1);
     }
 
-    // Terminals started from here must not believe they run inside another
-    // agent session (e.g. when TerminalRooster itself was launched from one).
     // SAFETY: no other threads exist yet.
-    unsafe {
-        std::env::remove_var("CLAUDECODE");
-        std::env::remove_var("CLAUDE_CODE_ENTRYPOINT");
-        std::env::remove_var("ANTIGRAVITY_AGENT");
-        std::env::remove_var("ANTIGRAVITY_CONVERSATION_ID");
-        std::env::remove_var("ANTIGRAVITY_TRAJECTORY_ID");
-        std::env::remove_var("ANTIGRAVITY_LS_ADDRESS");
-        std::env::remove_var("ANTIGRAVITY_CSRF_TOKEN");
-        std::env::remove_var("ANTIGRAVITY_SOURCE_METADATA");
-        std::env::remove_var("ANTIGRAVITY_PROJECT_ID");
-    }
+    unsafe { termroost_core::agent::clear_agent_env() };
 
     let config = Config { host: host_exe::command(data_dir.as_deref()), ..Config::default() };
     let core = match Core::open(config) {

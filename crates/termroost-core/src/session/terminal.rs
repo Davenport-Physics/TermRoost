@@ -236,6 +236,13 @@ impl Shared {
                 }
             }
             Signal::Cleared => self.pin.lock().unwrap().screen_cleared(),
+            Signal::StatusQuery => {
+                // OSC 7501 capability response so agents like Antigravity (`agy`)
+                // know this terminal reads their status sequences.
+                self.write(Cow::Borrowed(
+                    b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\",
+                ));
+            }
             signal => {
                 let alert = self.track(|t| t.signal(signal));
                 self.alert(alert);

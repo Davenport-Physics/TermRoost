@@ -8,7 +8,12 @@ use termroost_core::*;
 /// Agent state directories inside the test's temp dir, never the user's real ones.
 fn test_homes(dir: &Path) -> AgentHomes {
     let agents = dir.join("agent-homes");
-    AgentHomes { claude: agents.join("claude"), codex: agents.join("codex"), grok: agents.join("grok") }
+    AgentHomes {
+        claude: agents.join("claude"),
+        codex: agents.join("codex"),
+        grok: agents.join("grok"),
+        antigravity: agents.join("antigravity"),
+    }
 }
 
 fn open(dir: &Path) -> Core {
@@ -549,6 +554,7 @@ fn agents_started_by_hand_are_detected_and_resumed_exactly() {
         claude: dir.path().join("claude-home"),
         codex: dir.path().join("codex-home"),
         grok: dir.path().join("grok-home"),
+        antigravity: dir.path().join("antigravity-home"),
     };
     let fake = fake_claude(dir.path(), &homes);
     let open_with_homes = || {
@@ -679,6 +685,67 @@ fn codex_hook_reports_pin_threads_to_the_right_terminal() {
 
     core.remove_codex_hook().unwrap();
     assert!(!hooks_file.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn antigravity_started_by_hand_is_detected_and_resumed_exactly() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let homes = test_homes(dir.path());
+    let presence = homes.antigravity.join("presence");
+    let conversations = homes.antigravity.join("conversations");
+    std::fs::create_dir_all(&presence).unwrap();
+    std::fs::create_dir_all(&conversations).unwrap();
+
+    // A stand-in `agy` that holds its presence lock open, just like the real CLI.
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake = bin.join("agy");
+    let script = format!(
+        "#!/bin/sh\nexec 9>\"{}/$1.lock\"\necho \"FAKE-AGY running $1\"\nwhile :; do sleep 1; done\n",
+        presence.display()
+    );
+    std::fs::write(&fake, script).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let agent_of = |c: &Core, pane: PaneId| c.state().pane(pane).and_then(|p| p.agent.clone());
+    const A: &str = "5b161d7d-f369-4bf2-a5f5-37aced5dee01";
+    const B: &str = "5b161d7d-f369-4bf2-a5f5-37aced5dee02";
+
+    let pane;
+    {
+        let mut core = open(dir.path());
+        core.dispatch(Command::SetDefaultShell(Some("sh".into()))).unwrap();
+        core.dispatch(Command::CreateProject { name: "p".into(), working_dir: dir.path().into(), shell: None })
+            .unwrap();
+        pane = only_pane(&core);
+        let term = core.terminal(pane).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+
+        term.text(&format!("{} {A}\r", fake.display()));
+        wait_for_text(&mut core, pane, &format!("FAKE-AGY running {A}"));
+        wait_for(&mut core, Duration::from_secs(20), |c, _| {
+            agent_of(c, pane).is_some_and(|a| a.kind == AgentKind::Antigravity && a.session_id.as_deref() == Some(A))
+        });
+
+        // Quitting `agy` clears it.
+        term.write(vec![3u8]);
+        wait_for(&mut core, Duration::from_secs(20), |c, _| agent_of(c, pane).is_none());
+
+        // Start a second conversation with a saved `.db` file so it resumes.
+        std::fs::write(conversations.join(format!("{B}.db")), "").unwrap();
+        term.text(&format!("{} {B}\r", fake.display()));
+        wait_for_text(&mut core, pane, &format!("FAKE-AGY running {B}"));
+        wait_for(&mut core, Duration::from_secs(20), |c, _| {
+            agent_of(c, pane).is_some_and(|a| a.kind == AgentKind::Antigravity && a.session_id.as_deref() == Some(B))
+        });
+    }
+
+    let mut core = open(dir.path());
+    assert_eq!(agent_of(&core, pane).and_then(|a| a.session_id).as_deref(), Some(B));
+    wait_for_text(&mut core, pane, &format!("agy --resume {B}"));
 }
 
 /// Windows builds the command line by joining the program and its arguments:

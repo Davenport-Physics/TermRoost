@@ -416,8 +416,8 @@ impl App {
                 level_row(
                     Category::Agent,
                     "Coding agents",
-                    "Claude Code, Codex or Grok finishes its turn or waits for you. Programs that ask for a \
-                     notification count too.",
+                    "Claude Code, Codex, Grok or Antigravity finishes its turn or waits for you. Programs that ask for \
+                     a notification count too.",
                 ),
                 level_row(
                     Category::Error,

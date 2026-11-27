@@ -13,6 +13,13 @@
 //!   user thread in the process's directory created after it started (several
 //!   Codex instances in one directory are matched latest-started first); and
 //!   finally the rollout files on disk.
+//! * **Antigravity** (`agy`) holds its active conversation files open
+//!   (`~/.gemini/antigravity-cli/presence/<id>.lock` and `conversations/<id>.db`),
+//!   so on Linux the process's open descriptors identify its exact conversation.
+//!   Elsewhere, it is matched from `~/.gemini/antigravity-cli/conversation_summaries.db`
+//!   (the newest non-subagent conversation in the process's folder active since
+//!   the process started) or the id on its command line (`agy --resume <id>`,
+//!   `agy --conversation <id>`, `agy -r <id>`).
 //!
 //! The detector walks each terminal's process tree (the shell and everything
 //! below it) and looks every process up in those records. So agents are found
@@ -36,6 +43,7 @@ pub struct AgentHomes {
     pub claude: PathBuf,
     pub codex: PathBuf,
     pub grok: PathBuf,
+    pub antigravity: PathBuf,
 }
 
 impl Default for AgentHomes {
@@ -45,17 +53,23 @@ impl Default for AgentHomes {
 }
 
 impl AgentHomes {
-    /// `~/.claude`, `~/.codex` and `~/.grok`, honouring `CLAUDE_CONFIG_DIR`,
-    /// `CODEX_HOME` and `GROK_HOME`.
+    /// `~/.claude`, `~/.codex`, `~/.grok` and `~/.gemini/antigravity-cli`,
+    /// honouring `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`,
+    /// `ANTIGRAVITY_APP_DATA_DIR` and `ANTIGRAVITY_GEMINI_DIR`.
     pub fn from_env() -> AgentHomes {
         let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()).unwrap_or_default();
         let pick = |var: &str, dir: &str| {
             std::env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(|| home.join(dir))
         };
+        let antigravity = std::env::var_os("ANTIGRAVITY_APP_DATA_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| pick("ANTIGRAVITY_GEMINI_DIR", ".gemini").join("antigravity-cli"));
         AgentHomes {
             claude: pick("CLAUDE_CONFIG_DIR", ".claude"),
             codex: pick("CODEX_HOME", ".codex"),
             grok: pick("GROK_HOME", ".grok"),
+            antigravity,
         }
     }
 
@@ -66,8 +80,18 @@ impl AgentHomes {
             AgentKind::Claude => any_subdir(&self.claude.join("projects"), |d| d.join(format!("{id}.jsonl")).is_file()),
             AgentKind::Grok => any_subdir(&self.grok.join("sessions"), |d| d.join(id).is_dir()),
             AgentKind::Codex => codex_rollout_exists(&self.codex.join("sessions"), id),
+            AgentKind::Antigravity => antigravity_session_exists(&self.antigravity, id),
         }
     }
+}
+
+/// Looks for `conversations/<id>.db` or `conversations/<id>.pb`.
+fn antigravity_session_exists(home: &Path, id: &str) -> bool {
+    let dir = home.join("conversations");
+    if !dir.is_dir() {
+        return true;
+    }
+    dir.join(format!("{id}.db")).is_file() || dir.join(format!("{id}.pb")).is_file()
 }
 
 fn any_subdir(dir: &Path, found: impl Fn(&Path) -> bool) -> bool {
@@ -197,6 +221,7 @@ impl Detector {
         let grok = read_grok_registry(&homes.grok);
         let mut out = HashMap::new();
         let mut codex = Vec::new();
+        let mut antigravity = Vec::new();
 
         for (pane, shell) in shells {
             // Breadth first: the agent closest to the shell wins (an agent may
@@ -213,6 +238,10 @@ impl Detector {
                         codex.push((*pane, c));
                         break;
                     }
+                    Some(Hit::Antigravity(a)) => {
+                        antigravity.push((*pane, a));
+                        break;
+                    }
                     None => {}
                 }
                 if let Some(kids) = children.get(&pid) {
@@ -221,8 +250,12 @@ impl Detector {
             }
         }
 
-        if !codex.is_empty() {
-            let pids: Vec<Pid> = codex.iter().map(|(_, c)| Pid::from_u32(c.pid)).collect();
+        if !codex.is_empty() || !antigravity.is_empty() {
+            let pids: Vec<Pid> = codex
+                .iter()
+                .map(|(_, c)| Pid::from_u32(c.pid))
+                .chain(antigravity.iter().map(|(_, a)| Pid::from_u32(a.pid)))
+                .collect();
             sys.refresh_processes_specifics(
                 ProcessesToUpdate::Some(&pids),
                 false,
@@ -230,6 +263,9 @@ impl Detector {
             );
             for (_, c) in &mut codex {
                 c.cwd = sys.process(Pid::from_u32(c.pid)).and_then(|p| p.cwd()).map(Path::to_path_buf);
+            }
+            for (_, a) in &mut antigravity {
+                a.cwd = sys.process(Pid::from_u32(a.pid)).and_then(|p| p.cwd()).map(Path::to_path_buf);
             }
         }
         // Hook reports name the thread exactly; pin it to the right terminal.
@@ -260,6 +296,16 @@ impl Detector {
                 claimed.insert(id.clone());
             }
             out.insert(pane, ObservedAgent { kind: AgentKind::Codex, session_id: id, pid: c.pid });
+        }
+
+        antigravity.sort_by_key(|(_, a)| std::cmp::Reverse(a.started));
+        let mut agy_claimed: HashSet<String> = HashSet::new();
+        for (pane, a) in antigravity {
+            let id = antigravity_conversation(&homes.antigravity, &a, &agy_claimed);
+            if let Some(id) = &id {
+                agy_claimed.insert(id.clone());
+            }
+            out.insert(pane, ObservedAgent { kind: AgentKind::Antigravity, session_id: id, pid: a.pid });
         }
         out
     }
@@ -710,9 +756,19 @@ struct CodexProcess {
     cmd: Vec<String>,
 }
 
+/// An Antigravity (`agy`) terminal whose conversation is resolved after all panes are scanned.
+struct AntigravityProcess {
+    pid: u32,
+    /// Seconds since the epoch.
+    started: u64,
+    cwd: Option<PathBuf>,
+    cmd: Vec<String>,
+}
+
 enum Hit {
     Agent(ObservedAgent),
     Codex(CodexProcess),
+    Antigravity(AntigravityProcess),
 }
 
 fn identify(homes: &AgentHomes, pid: Pid, p: &Process, grok: &HashMap<u32, (String, Option<u64>)>) -> Option<Hit> {
@@ -730,6 +786,14 @@ fn identify(homes: &AgentHomes, pid: Pid, p: &Process, grok: &HashMap<u32, (Stri
     }
     if runs(p, "codex") {
         return Some(Hit::Codex(CodexProcess {
+            pid: raw,
+            started: p.start_time(),
+            cwd: None,
+            cmd: p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect(),
+        }));
+    }
+    if runs(p, "agy") {
+        return Some(Hit::Antigravity(AntigravityProcess {
             pid: raw,
             started: p.start_time(),
             cwd: None,
@@ -938,6 +1002,178 @@ fn newest_main_thread(codex_home: &Path, ids: &[String]) -> Option<String> {
     conn.query_row(&sql, rusqlite::params_from_iter(ids.iter()), |r| r.get(0)).ok()
 }
 
+/// The conversation an Antigravity (`agy`) terminal is working on (see the module docs).
+fn antigravity_conversation(agy_home: &Path, a: &AntigravityProcess, claimed: &HashSet<String>) -> Option<String> {
+    let resumed = resumed_antigravity_conversation(&a.cmd);
+    #[cfg(target_os = "linux")]
+    {
+        let own: Vec<String> =
+            linux_antigravity_conversations(agy_home, a.pid).into_iter().filter(|id| !claimed.contains(id)).collect();
+        if let Some(id) = pick_antigravity_conversation(agy_home, own) {
+            return Some(id);
+        }
+    }
+    let Some(cwd) = a.cwd.as_deref() else {
+        return resumed;
+    };
+    match antigravity_db_conversations(agy_home, cwd, a.started, resumed.as_deref()) {
+        Some(ids) => ids.into_iter().find(|id| !claimed.contains(id)).or(resumed),
+        None => resumed,
+    }
+}
+
+/// The conversation id named on an `agy --resume <id>` / `--conversation <id>` / `-r <id>` command line.
+fn resumed_antigravity_conversation(cmd: &[String]) -> Option<String> {
+    for (i, arg) in cmd.iter().enumerate() {
+        for flag in ["--resume", "--conversation", "-r"] {
+            if let Some(val) = arg.strip_prefix(flag).and_then(|s| s.strip_prefix('='))
+                && looks_like_uuid(val)
+            {
+                return Some(val.to_owned());
+            }
+            if arg == flag
+                && let Some(val) = cmd.get(i + 1)
+                && looks_like_uuid(val)
+            {
+                return Some(val.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Conversation ids whose presence lock or database file the process holds open.
+#[cfg(target_os = "linux")]
+fn linux_antigravity_conversations(agy_home: &Path, pid: u32) -> Vec<String> {
+    let home = std::fs::canonicalize(agy_home).unwrap_or_else(|_| agy_home.to_path_buf());
+    let presence = home.join("presence");
+    let conversations = home.join("conversations");
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { return Vec::new() };
+    let mut ids = Vec::new();
+    for fd in fds.flatten() {
+        let Ok(target) = std::fs::read_link(fd.path()) else { continue };
+        if let Some(id) = antigravity_conversation_of_path(&target, &presence, &conversations)
+            && !ids.contains(&id)
+        {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// The conversation id named by a presence lock (`<id>.lock`) or conversation
+/// file (`<id>.db`, `<id>.db-wal`, `<id>.db-shm`, `<id>.pb`).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn antigravity_conversation_of_path(path: &Path, presence: &Path, conversations: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    if path.starts_with(presence) {
+        return name.strip_suffix(".lock").filter(|id| looks_like_uuid(id)).map(str::to_owned);
+    }
+    if path.starts_with(conversations) {
+        for suffix in [".db", ".db-wal", ".db-shm", ".pb"] {
+            if let Some(id) = name.strip_suffix(suffix) {
+                return looks_like_uuid(id).then(|| id.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Chooses the main conversation when a process holds several (e.g. subagents).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn pick_antigravity_conversation(agy_home: &Path, ids: Vec<String>) -> Option<String> {
+    if ids.len() <= 1 {
+        return ids.into_iter().next();
+    }
+    if let Some(id) = newest_main_antigravity_conversation(agy_home, &ids) {
+        return Some(id);
+    }
+    ids.into_iter().max_by_key(|id| antigravity_file_time(agy_home, id).unwrap_or(UNIX_EPOCH))
+}
+
+fn open_antigravity_summaries(agy_home: &Path) -> Option<rusqlite::Connection> {
+    let db = agy_home.join("conversation_summaries.db");
+    if !db.is_file() {
+        return None;
+    }
+    rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn newest_main_antigravity_conversation(agy_home: &Path, ids: &[String]) -> Option<String> {
+    let conn = open_antigravity_summaries(agy_home)?;
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!(
+        "SELECT conversation_id FROM conversation_summaries \
+         WHERE conversation_id IN ({placeholders}) AND parent_conversation_id = '' AND killed = 0 \
+         ORDER BY last_modified_time DESC LIMIT 1"
+    );
+    conn.query_row(&sql, rusqlite::params_from_iter(ids.iter()), |r| r.get(0)).ok()
+}
+
+/// Candidate conversations from Antigravity's `conversation_summaries.db`, best
+/// first: non-subagent, non-killed conversations in `cwd` active since `started`
+/// (or the resumed one). `None` when the database cannot be read.
+fn antigravity_db_conversations(
+    agy_home: &Path,
+    cwd: &Path,
+    started: u64,
+    resumed: Option<&str>,
+) -> Option<Vec<String>> {
+    let conn = open_antigravity_summaries(agy_home)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT conversation_id, workspace_uris, last_modified_time \
+             FROM conversation_summaries \
+             WHERE parent_conversation_id = '' AND killed = 0",
+        )
+        .ok()?;
+    let since = UNIX_EPOCH + Duration::from_secs(started.saturating_sub(2));
+    let mut matches: Vec<(SystemTime, String)> = Vec::new();
+    let rows =
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))).ok()?;
+    for (id, uris_json, modified) in rows.flatten() {
+        if !looks_like_uuid(&id) {
+            continue;
+        }
+        let uris: Vec<String> = serde_json::from_str(&uris_json).unwrap_or_default();
+        if !uris.iter().any(|u| crate::session::osc::file_url_to_path(u).is_some_and(|p| agent::same_dir(&p, cwd))) {
+            continue;
+        }
+        let time = parse_antigravity_time(&modified).or_else(|| antigravity_file_time(agy_home, &id));
+        let is_resumed = resumed == Some(id.as_str());
+        if is_resumed || time.is_some_and(|t| t >= since) {
+            matches.push((time.unwrap_or(UNIX_EPOCH), id));
+        }
+    }
+    matches.sort_by_key(|a| std::cmp::Reverse(a.0));
+    Some(matches.into_iter().map(|(_, id)| id).collect())
+}
+
+/// Parses Go's SQLite datetime string (e.g. `2026-11-27 13:55:40.773+00:00`).
+/// Returns `None` for Go's zero time (`0001-01-01 ...`).
+fn parse_antigravity_time(s: &str) -> Option<SystemTime> {
+    let s = s.trim();
+    let normalized = if s.as_bytes().get(10) == Some(&b' ') { format!("{}T{}", &s[..10], &s[11..]) } else { s.into() };
+    let dt = chrono::DateTime::parse_from_rfc3339(&normalized).ok()?;
+    let secs = u64::try_from(dt.timestamp()).ok()?;
+    if secs == 0 {
+        return None;
+    }
+    Some(UNIX_EPOCH + Duration::new(secs, dt.timestamp_subsec_nanos()))
+}
+
+fn antigravity_file_time(agy_home: &Path, id: &str) -> Option<SystemTime> {
+    [
+        agy_home.join("presence").join(format!("{id}.lock")),
+        agy_home.join("conversations").join(format!("{id}.db")),
+        agy_home.join("conversations").join(format!("{id}.pb")),
+    ]
+    .into_iter()
+    .filter_map(|p| std::fs::metadata(p).ok().and_then(|m| m.modified().or_else(|_| m.created()).ok()))
+    .max()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1030,7 +1266,12 @@ mod tests {
     }
 
     fn homes(dir: &Path) -> AgentHomes {
-        AgentHomes { claude: dir.join("claude"), codex: dir.join("codex"), grok: dir.join("grok") }
+        AgentHomes {
+            claude: dir.join("claude"),
+            codex: dir.join("codex"),
+            grok: dir.join("grok"),
+            antigravity: dir.join("antigravity"),
+        }
     }
 
     #[test]
@@ -1082,6 +1323,99 @@ mod tests {
         std::fs::write(h.codex.join(format!("sessions/2026/11/15/rollout-2026-11-15T16-34-17-{id}.jsonl")), "")
             .unwrap();
         assert!(h.session_exists(AgentKind::Codex, id));
+
+        assert!(h.session_exists(AgentKind::Antigravity, id), "unknown layout");
+        std::fs::create_dir_all(h.antigravity.join("conversations")).unwrap();
+        assert!(!h.session_exists(AgentKind::Antigravity, id));
+        std::fs::write(h.antigravity.join(format!("conversations/{id}.db")), "").unwrap();
+        assert!(h.session_exists(AgentKind::Antigravity, id));
+        let pb_id = "01a1e121-e618-7503-83d2-6767497fb5d8";
+        std::fs::write(h.antigravity.join(format!("conversations/{pb_id}.pb")), "").unwrap();
+        assert!(h.session_exists(AgentKind::Antigravity, pb_id));
+    }
+
+    #[test]
+    fn antigravity_paths_and_resume_argument() {
+        let presence = Path::new("/h/.gemini/antigravity-cli/presence");
+        let convs = Path::new("/h/.gemini/antigravity-cli/conversations");
+        let id = "5b161d7d-f369-4bf2-a5f5-37aced5dee37";
+        assert_eq!(
+            antigravity_conversation_of_path(&presence.join(format!("{id}.lock")), presence, convs),
+            Some(id.into())
+        );
+        assert_eq!(antigravity_conversation_of_path(&convs.join(format!("{id}.db")), presence, convs), Some(id.into()));
+        assert_eq!(
+            antigravity_conversation_of_path(&convs.join(format!("{id}.db-wal")), presence, convs),
+            Some(id.into())
+        );
+        assert_eq!(antigravity_conversation_of_path(&convs.join(format!("{id}.pb")), presence, convs), Some(id.into()));
+        assert_eq!(antigravity_conversation_of_path(&presence.join("junk.lock"), presence, convs), None);
+        assert_eq!(
+            antigravity_conversation_of_path(Path::new("/h/.gemini/antigravity-cli/cli.log"), presence, convs),
+            None
+        );
+
+        let cmd = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(resumed_antigravity_conversation(&cmd(&["agy", "--resume", id])), Some(id.into()));
+        assert_eq!(resumed_antigravity_conversation(&cmd(&["agy", "--conversation", id])), Some(id.into()));
+        assert_eq!(resumed_antigravity_conversation(&cmd(&["agy", "-r", id])), Some(id.into()));
+        assert_eq!(resumed_antigravity_conversation(&cmd(&["agy", &format!("--resume={id}")])), Some(id.into()));
+        assert_eq!(resumed_antigravity_conversation(&cmd(&["agy", "--continue"])), None);
+    }
+
+    #[test]
+    fn antigravity_conversations_from_summary_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("agy");
+        let proj = tmp.path().join("proj");
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let uri = |p: &Path| {
+            let s = p.to_string_lossy().replace('\\', "/");
+            let s = if s.starts_with('/') { s } else { format!("/{s}") };
+            serde_json::json!([format!("file://{s}")]).to_string()
+        };
+        let (p, o) = (uri(&proj), uri(&other));
+        let id = |n: u8| format!("5b161d7d-f369-4bf2-a5f5-37aced5dee{n:02x}");
+        let (old, new_a, new_b, sub, killed, elsewhere) = (id(1), id(2), id(3), id(4), id(5), id(6));
+        let conn = rusqlite::Connection::open(home.join("conversation_summaries.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversation_summaries (
+                conversation_id text PRIMARY KEY,
+                last_modified_time datetime NOT NULL,
+                workspace_uris text NOT NULL,
+                parent_conversation_id text NOT NULL DEFAULT '',
+                killed numeric NOT NULL DEFAULT false
+            );",
+        )
+        .unwrap();
+        let rows = [
+            (&old, "2026-11-27 10:00:00+00:00", &p, "", 0),
+            (&new_a, "2026-11-27 12:01:00+00:00", &p, "", 0),
+            (&new_b, "2026-11-27 12:05:00.500000+00:00", &p, "", 0),
+            (&sub, "2026-11-27 12:06:00+00:00", &p, new_b.as_str(), 0),
+            (&killed, "2026-11-27 12:07:00+00:00", &p, "", 1),
+            (&elsewhere, "2026-11-27 12:08:00+00:00", &o, "", 0),
+        ];
+        for (cid, ts, uris, parent, k) in rows {
+            conn.execute(
+                "INSERT INTO conversation_summaries VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![cid, ts, uris, parent, k],
+            )
+            .unwrap();
+        }
+        let started = chrono::DateTime::parse_from_rfc3339("2026-11-27T12:00:00Z").unwrap().timestamp() as u64;
+        assert_eq!(antigravity_db_conversations(&home, &proj, started, None), Some(vec![new_b.clone(), new_a.clone()]));
+        assert_eq!(
+            antigravity_db_conversations(&home, &proj, started, Some(&old)),
+            Some(vec![new_b.clone(), new_a.clone(), old.clone()])
+        );
+        let proc = AntigravityProcess { pid: 0, started, cwd: Some(proj.clone()), cmd: vec!["agy".into()] };
+        let claimed: HashSet<String> = [new_b.clone()].into();
+        assert_eq!(antigravity_conversation(&home, &proc, &claimed), Some(new_a.clone()));
+        assert_eq!(newest_main_antigravity_conversation(&home, &[sub.clone(), new_a.clone()]), Some(new_a.clone()));
     }
 
     #[test]

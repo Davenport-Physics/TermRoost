@@ -359,7 +359,9 @@ impl App {
                         .on_press(Message::DialogStartAgent(*k))
                         .into()
                 }))
-                .spacing(6);
+                .spacing(6)
+                .wrap()
+                .vertical_spacing(6);
                 let body = column![
                     status,
                     field(
@@ -368,9 +370,9 @@ impl App {
                     ),
                     start,
                     muted_text(
-                        "Claude Code, Codex and Grok are detected automatically, also when you start them yourself, \
-                         and Terminal Rooster follows the session they are in (including /clear). After a restart each \
-                         terminal resumes its own conversation, not just the most recent one.",
+                        "Claude Code, Codex, Grok and Antigravity are detected automatically, also when you start \
+                         them yourself, and Terminal Rooster follows the session they are in (including /clear). \
+                         After a restart each terminal resumes its own conversation, not just the most recent one.",
                     )
                     .size(12),
                     field(

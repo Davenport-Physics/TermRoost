@@ -6,9 +6,9 @@
 //!
 //! * Claude Code and Grok accept `--session-id <uuid>` at launch, so the id is
 //!   generated up front and resumed with `--resume <uuid>`.
-//! * Codex cannot be given an id; it is found by [`crate::detect`], which also
-//!   tracks agents started by hand and new sessions started from inside an
-//!   agent (`/clear`, `/new`).
+//! * Codex and Antigravity cannot be given an id; they are found by
+//!   [`crate::detect`], which also tracks agents started by hand and new
+//!   sessions started from inside an agent (`/clear`, `/new`).
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -21,16 +21,18 @@ pub enum AgentKind {
     Claude,
     Codex,
     Grok,
+    Antigravity,
 }
 
 impl AgentKind {
-    pub const ALL: [AgentKind; 3] = [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok];
+    pub const ALL: [AgentKind; 4] = [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok, AgentKind::Antigravity];
 
     pub fn as_str(self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Grok => "grok",
+            AgentKind::Antigravity => "agy",
         }
     }
 
@@ -39,16 +41,20 @@ impl AgentKind {
             AgentKind::Claude => "Claude Code",
             AgentKind::Codex => "Codex",
             AgentKind::Grok => "Grok",
+            AgentKind::Antigravity => "Antigravity",
         }
     }
 
     pub fn parse(s: &str) -> Option<AgentKind> {
-        AgentKind::ALL.into_iter().find(|k| k.as_str() == s)
+        match s {
+            "antigravity" => Some(AgentKind::Antigravity),
+            _ => AgentKind::ALL.into_iter().find(|k| k.as_str() == s),
+        }
     }
 
     /// Whether the session id can be chosen at launch.
     pub fn assigns_id(self) -> bool {
-        !matches!(self, AgentKind::Codex)
+        matches!(self, AgentKind::Claude | AgentKind::Grok)
     }
 }
 
@@ -62,7 +68,7 @@ impl std::fmt::Display for AgentKind {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentSession {
     pub kind: AgentKind,
-    /// Known session id; `None` while a Codex session is still being discovered.
+    /// Known session id; `None` while a Codex or Antigravity session is still being discovered.
     pub session_id: Option<String>,
     /// Extra command-line arguments, reused when resuming (e.g. `--model opus`).
     pub args: String,
@@ -91,6 +97,7 @@ impl AgentSession {
         let base = match self.kind {
             AgentKind::Claude => format!("claude --resume {id}"),
             AgentKind::Grok => format!("grok --resume {id}"),
+            AgentKind::Antigravity => format!("agy --resume {id}"),
             AgentKind::Codex => {
                 // `codex resume [OPTIONS] [SESSION_ID]`: options go before the id.
                 return Some(join_args("codex resume".into(), &self.args) + " " + id);
@@ -212,6 +219,15 @@ mod tests {
         assert_eq!(c.resume_command(), None);
         c.session_id = Some("abc".into());
         assert_eq!(c.resume_command().unwrap(), "codex resume --yolo abc");
+
+        let mut a = AgentSession::new(AgentKind::Antigravity, "--model flash".into());
+        assert_eq!(a.session_id, None);
+        assert_eq!(a.launch_command(), "agy --model flash");
+        assert_eq!(a.resume_command(), None);
+        a.session_id = Some("abc".into());
+        assert_eq!(a.resume_command().unwrap(), "agy --resume abc --model flash");
+        assert_eq!(AgentKind::parse("agy"), Some(AgentKind::Antigravity));
+        assert_eq!(AgentKind::parse("antigravity"), Some(AgentKind::Antigravity));
     }
 
     #[test]

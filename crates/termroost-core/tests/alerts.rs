@@ -15,6 +15,7 @@ fn open(dir: &Path) -> Core {
             claude: agents.join("claude"),
             codex: agents.join("codex"),
             grok: agents.join("grok"),
+            antigravity: agents.join("antigravity"),
         },
         ..Default::default()
     })
@@ -145,6 +146,18 @@ fn check(shell: Shell) {
     assert_eq!(
         next_alert(&mut core, pane, long),
         Alert::Agent { agent: Some(AgentKind::Codex), event: AgentEvent::Done, message: None }
+    );
+
+    // Antigravity's lifecycle state (OSC 7501, with base64 detail message).
+    run(&(shell.print)(r"\e]7501;state=working:app=agy\e\"));
+    run(&(shell.print)(r"\e]7501;state=blocked:app=agy:kind=permission:msg=UnVuIHRlc3RzPw==\e\"));
+    assert_eq!(
+        next_alert(&mut core, pane, long),
+        Alert::Agent {
+            agent: Some(AgentKind::Antigravity),
+            event: AgentEvent::Approval,
+            message: Some("Run tests?".into()),
+        }
     );
 
     // Claude Code's title, which it sets while it runs. (Not from two commands:

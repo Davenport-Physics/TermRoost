@@ -16,6 +16,8 @@ static CODEX: LazyLock<svg::Handle> =
     LazyLock::new(|| svg::Handle::from_memory(include_bytes!("../icons/codex.svg").as_slice()));
 static GROK: LazyLock<svg::Handle> =
     LazyLock::new(|| svg::Handle::from_memory(include_bytes!("../icons/grok.svg").as_slice()));
+static ANTIGRAVITY: LazyLock<svg::Handle> =
+    LazyLock::new(|| svg::Handle::from_memory(include_bytes!("../icons/antigravity.svg").as_slice()));
 // The app icon only exists as PNGs. Wrapped in an SVG, it goes through the same
 // `svg` widget and cache as the logos, without iced's `image` feature.
 static TERMINAL: LazyLock<svg::Handle> = LazyLock::new(|| {
@@ -34,13 +36,14 @@ pub fn agent_icon<'a>(kind: AgentKind, size: f32, ink: impl Fn(&Theme) -> Color 
         AgentKind::Claude => &CLAUDE,
         AgentKind::Codex => &CODEX,
         AgentKind::Grok => &GROK,
+        AgentKind::Antigravity => &ANTIGRAVITY,
     };
     let icon = svg(LazyLock::force(handle).clone()).width(size).height(size);
     match kind {
         // Grok's logo is plain black or white, so it can't keep a color of its
         // own on both light and dark backgrounds.
         AgentKind::Grok => icon.style(move |t, _| svg::Style { color: Some(ink(t)) }),
-        AgentKind::Claude | AgentKind::Codex => icon,
+        AgentKind::Claude | AgentKind::Codex | AgentKind::Antigravity => icon,
     }
 }
 
@@ -86,5 +89,20 @@ mod tests {
             assert_eq!(base64(plain.as_bytes()), encoded, "{plain:?}");
         }
         assert_eq!(base64(&[0xff, 0xfe, 0x00]), "//4A");
+    }
+
+    #[test]
+    fn agent_svgs_parse() {
+        let icons: &[(&str, &[u8])] = &[
+            ("claude", include_bytes!("../icons/claude.svg")),
+            ("codex", include_bytes!("../icons/codex.svg")),
+            ("grok", include_bytes!("../icons/grok.svg")),
+            ("antigravity", include_bytes!("../icons/antigravity.svg")),
+        ];
+        let opts = usvg::Options::default();
+        for (name, bytes) in icons {
+            let tree = usvg::Tree::from_data(bytes, &opts).unwrap_or_else(|e| panic!("{name}.svg failed: {e}"));
+            assert!(tree.size().width() > 0.0 && tree.size().height() > 0.0, "{name}.svg empty size");
+        }
     }
 }

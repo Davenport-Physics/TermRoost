@@ -4,7 +4,7 @@
 
 # Terminal Rooster
 
-A project-based terminal manager for running coding agents (Claude Code, Codex, Grok, …) side by side.
+A project-based terminal manager for running coding agents (Claude Code, Codex, Grok, Antigravity, …) side by side.
 
 *TR, TermRoost or Rooster for short.*
 

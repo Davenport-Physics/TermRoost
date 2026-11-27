@@ -8,8 +8,8 @@
 //!   [`crate::session::integration`]). Other shells can send it themselves.
 //! * **Claude Code** puts its state in the terminal title: `◐`/`◑` in front
 //!   while it works, `✳` when it is idle or waiting for an answer.
-//! * **Codex** reports its state with `OSC 7501` (`working`, `done`, `error`,
-//!   `blocked` on an approval, a question or a sign-in).
+//! * **Codex and Antigravity** report their state with `OSC 7501` (`working`,
+//!   `done`, `error`, `blocked` on an approval, a question or a sign-in).
 //! * **Progress indicators** (`OSC 9 ; 4`), which Grok shows while working.
 //! * **Notifications** a program asks for (`OSC 9`, `OSC 777`, `OSC 99`),
 //!   and the bell, which agents use at the end of a turn in terminals they
@@ -169,8 +169,8 @@ impl Tracker {
                 self.progress_busy = true;
                 None
             }
-            Signal::Cwd(_) | Signal::Cleared => None,
-            Signal::Status { state, app, kind } => {
+            Signal::Cwd(_) | Signal::Cleared | Signal::StatusQuery => None,
+            Signal::Status { state, app, kind, message } => {
                 let agent = app.as_deref().and_then(AgentKind::parse);
                 let event = match state.as_str() {
                     "working" => {
@@ -191,7 +191,7 @@ impl Tracker {
                     }
                 };
                 self.status_busy = false;
-                Some(self.agent_alert(agent, event))
+                Some(Alert::Agent { agent: agent.or(self.agent), event, message })
             }
             Signal::Notify { title, body } => Some(match self.agent {
                 Some(agent) => {
@@ -249,6 +249,7 @@ mod tests {
             state: state.into(),
             app: Some("codex".into()),
             kind: kind.map(Into::into),
+            message: None,
         };
         assert_eq!(t.signal(status("idle", None)), None);
         assert_eq!(t.signal(status("working", None)), None);
@@ -261,8 +262,33 @@ mod tests {
         t.signal(status("working", None));
         assert_eq!(t.signal(status("error", None)), agent(AgentKind::Codex, AgentEvent::Failed));
         t.signal(status("working", None));
-        assert_eq!(t.signal(Signal::Status { state: "clear".into(), app: None, kind: None }), None);
+        assert_eq!(t.signal(Signal::Status { state: "clear".into(), app: None, kind: None, message: None }), None);
         assert!(!t.busy(), "Codex quit");
+    }
+
+    #[test]
+    fn antigravity_status() {
+        let mut t = Tracker::default();
+        let status = |state: &str, kind: Option<&str>, message: Option<&str>| Signal::Status {
+            state: state.into(),
+            app: Some("agy".into()),
+            kind: kind.map(Into::into),
+            message: message.map(Into::into),
+        };
+        assert_eq!(t.signal(status("working", None, None)), None);
+        assert!(t.busy());
+        assert_eq!(
+            t.signal(status("blocked", Some("permission"), Some("Run cargo test?"))),
+            Some(Alert::Agent {
+                agent: Some(AgentKind::Antigravity),
+                event: AgentEvent::Approval,
+                message: Some("Run cargo test?".into()),
+            })
+        );
+        assert!(!t.busy());
+        t.signal(status("working", None, None));
+        assert_eq!(t.signal(status("done", None, None)), agent(AgentKind::Antigravity, AgentEvent::Done));
+        assert_eq!(t.signal(Signal::StatusQuery), None);
     }
 
     #[test]
@@ -311,7 +337,7 @@ mod tests {
         t.reset();
         assert_eq!(t.running(), None, "a new shell runs nothing yet");
         // Agents and nested shells wait for the user most of the time.
-        for line in ["claude --resume x", "bash", "Codex"] {
+        for line in ["claude --resume x", "bash", "Codex", "agy --resume x"] {
             start(&mut t, line);
             assert_eq!(t.running(), None, "{line}");
         }

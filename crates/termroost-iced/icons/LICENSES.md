@@ -6,8 +6,8 @@ under its own license (MIT).
 # Agent logos
 
 The logos are trademarks of their owners: Claude of Anthropic, Codex of
-OpenAI, Grok of xAI. Terminal Rooster shows them only to mark which agent runs
-in a terminal.
+OpenAI, Grok of xAI, Antigravity of Google. Terminal Rooster shows them only
+to mark which agent runs in a terminal.
 
 ## claude.svg
 
@@ -15,12 +15,13 @@ The path is `icons/claude.svg` from [Simple Icons](https://simpleicons.org)
 16.38.0, released under CC0 1.0 Universal. The fill is Claude's orange,
 `#D97757`.
 
-## codex.svg, grok.svg
+## codex.svg, grok.svg, antigravity.svg
 
-The paths are `icons/codex.svg` and `icons/grok.svg` from
+The paths are `icons/codex.svg`, `icons/grok.svg` and
+`icons/antigravity-color.svg` from
 [LobeHub Icons](https://github.com/lobehub/lobe-icons)
-(`@lobehub/icons-static-svg` 1.102.0). The Codex gradient comes from the same
-package's `codex-color.svg`. They are used under this license:
+(`@lobehub/icons-static-svg` 1.102.0 / 1.106.0). The Codex gradient comes from
+the same package's `codex-color.svg`. They are used under this license:
 
 ```
 MIT License

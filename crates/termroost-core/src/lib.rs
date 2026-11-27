@@ -64,7 +64,7 @@ pub struct Config {
     /// How often changed scrollback is saved and terminals are checked for
     /// agents and other programs.
     pub autosave_interval: Duration,
-    /// Where Claude Code, Codex and Grok keep their session records.
+    /// Where Claude Code, Codex, Grok and Antigravity keep their session records.
     pub agent_homes: AgentHomes,
     /// How to start the helper process a terminal that keeps running when
     /// TerminalRooster quits runs under (see [`host`]). Without one, such

@@ -6,9 +6,9 @@
 //!   `OSC 633 ; E ; <command>` names the command.
 //! * `OSC 9 ; 4 ; <state> ; <percent>`: a progress indicator (ConEmu, Windows
 //!   Terminal). Agents such as Grok show one while they work.
-//! * `OSC 7501 ; state=<state>:app=<name>[:kind=<why>]`: a program's
-//!   lifecycle state (`working`, `done`, `error`, `blocked`, `idle`, `clear`).
-//!   Codex sends it to every terminal.
+//! * `OSC 7501 ; state=<state>:app=<name>[:kind=<why>][:msg=<b64>]`: a program's
+//!   lifecycle state (`working`, `done`, `error`, `blocked`, `idle`, `clear`),
+//!   and `OSC 7501 ; ?` to query support. Codex and Antigravity (`agy`) send it.
 //! * `OSC 9 ; <text>` (iTerm2), `OSC 777 ; notify ; <title> ; <body>`
 //!   (urxvt, Ghostty, VTE) and `OSC 99` (kitty): a program asks for a desktop
 //!   notification, e.g. Codex or Grok at the end of a turn.
@@ -32,8 +32,11 @@ pub(crate) enum Signal {
     /// `OSC 9;4` progress: 0 clears it, 1–4 show it (normal, error, busy, paused).
     Progress(u8),
     /// `OSC 7501` program state, e.g. `working` or `done`, with the program's
-    /// name and, for `blocked`, what it waits for (`permission`, `question`, `auth`).
-    Status { state: String, app: Option<String>, kind: Option<String> },
+    /// name, what it waits for (`permission`, `question`, `auth`) when
+    /// `blocked`, and any optional detail message (`msg=`).
+    Status { state: String, app: Option<String>, kind: Option<String>, message: Option<String> },
+    /// `OSC 7501 ; ?`: a program probing whether the terminal supports OSC 7501.
+    StatusQuery,
     /// A program asked for a desktop notification.
     Notify { title: Option<String>, body: String },
     /// The shell's working directory, as an absolute path of this system.
@@ -219,17 +222,24 @@ impl OscScanner {
             }
             "99" => self.kitty(rest, out),
             "7501" => {
-                let (mut state, mut app, mut kind) = (None, None, None);
+                if rest.trim() == "?" {
+                    out.push(Signal::StatusQuery);
+                    return;
+                }
+                let (mut state, mut app, mut kind, mut msg) = (None, None, None, None);
                 for kv in rest.split(':') {
                     match kv.split_once('=') {
                         Some(("state", v)) => state = Some(v.trim().to_owned()),
                         Some(("app", v)) => app = Some(v.trim().to_owned()),
                         Some(("kind", v)) => kind = Some(v.trim().to_owned()),
+                        Some(("msg", v)) => {
+                            msg = decode_base64_utf8(v.trim()).map(|s| clean(&s)).filter(|s| !s.is_empty());
+                        }
                         _ => {}
                     }
                 }
                 if let Some(state) = state.filter(|s| !s.is_empty()) {
-                    out.push(Signal::Status { state, app, kind });
+                    out.push(Signal::Status { state, app, kind, message: msg });
                 }
             }
             _ => {}
@@ -359,6 +369,37 @@ fn windows_path(path: &str) -> String {
     if converted.len() == 2 && converted.ends_with(':') { converted + "\\" } else { converted }
 }
 
+/// Turns a `file://` URL into an absolute path of this system.
+pub(crate) fn file_url_to_path(url: &str) -> Option<PathBuf> {
+    file_url_path(url).and_then(|p| cwd(&p))
+}
+
+/// Decodes standard (or URL-safe, padded or unpadded) base64 into UTF-8.
+fn decode_base64_utf8(s: &str) -> Option<String> {
+    let mut buf = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc = 0u32;
+    let mut bits = 0u8;
+    for b in s.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(val);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            buf.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    String::from_utf8(buf).ok()
+}
+
 /// Notification text without control characters, trimmed and kept short.
 fn clean(s: &str) -> String {
     let s: String = s.chars().filter(|c| !c.is_control()).collect();
@@ -421,14 +462,30 @@ mod tests {
         // What Codex writes.
         assert_eq!(
             scan(&[b"\x1b]7501;state=working:app=codex\x1b\\"]),
-            vec![Signal::Status { state: "working".into(), app: Some("codex".into()), kind: None }]
+            vec![Signal::Status { state: "working".into(), app: Some("codex".into()), kind: None, message: None }]
         );
         assert_eq!(
             scan(&[b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\\x1b]7501;state=clear\x1b\\"]),
             vec![
-                Signal::Status { state: "blocked".into(), app: Some("codex".into()), kind: Some("permission".into()) },
-                Signal::Status { state: "clear".into(), app: None, kind: None },
+                Signal::Status {
+                    state: "blocked".into(),
+                    app: Some("codex".into()),
+                    kind: Some("permission".into()),
+                    message: None,
+                },
+                Signal::Status { state: "clear".into(), app: None, kind: None, message: None },
             ]
+        );
+        // Capability probe and Antigravity status with a base64 message.
+        assert_eq!(scan(&[b"\x1b]7501;?\x07"]), vec![Signal::StatusQuery]);
+        assert_eq!(
+            scan(&[b"\x1b]7501;state=blocked:app=agy:kind=permission:msg=UnVuIHRlc3RzPw==\x1b\\"]),
+            vec![Signal::Status {
+                state: "blocked".into(),
+                app: Some("agy".into()),
+                kind: Some("permission".into()),
+                message: Some("Run tests?".into()),
+            }]
         );
     }
 

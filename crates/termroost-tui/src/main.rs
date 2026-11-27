@@ -67,11 +67,18 @@ fn main() -> ExitCode {
     };
 
     // Terminals started from here must not believe they run inside another
-    // Claude Code session (when this was itself started from one).
+    // agent session (when this was itself started from one).
     // SAFETY: no other threads exist yet.
     unsafe {
         std::env::remove_var("CLAUDECODE");
         std::env::remove_var("CLAUDE_CODE_ENTRYPOINT");
+        std::env::remove_var("ANTIGRAVITY_AGENT");
+        std::env::remove_var("ANTIGRAVITY_CONVERSATION_ID");
+        std::env::remove_var("ANTIGRAVITY_TRAJECTORY_ID");
+        std::env::remove_var("ANTIGRAVITY_LS_ADDRESS");
+        std::env::remove_var("ANTIGRAVITY_CSRF_TOKEN");
+        std::env::remove_var("ANTIGRAVITY_SOURCE_METADATA");
+        std::env::remove_var("ANTIGRAVITY_PROJECT_ID");
     }
     let _log = logging::init(termroost_core::paths::default_data_dir().ok().as_deref());
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "terminalrooster-tui starting");

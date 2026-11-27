@@ -23,6 +23,7 @@ Such terminals carry an ∞ mark, and quitting doesn't count them as programs it
 | Claude Code | `~/.claude/sessions/<pid>.json`, rewritten on `/clear` | `claude --resume <id>` |
 | Grok | `~/.grok/active_sessions.json` (`pid` → `session_id`) | `grok --resume <id>` |
 | Codex | Codex's thread table (`~/.codex/state_*.sqlite`): the newest user thread in the process's folder started after the process, or the id in `codex resume <id>` | `codex resume <id>` |
+| Antigravity | The conversation file held open by `agy` on Linux (`~/.gemini/antigravity-cli/presence/<id>.lock`, `conversations/<id>.db`), `~/.gemini/antigravity-cli/conversation_summaries.db`, or the id in `agy --resume <id>` / `--conversation <id>` | `agy --resume <id>` |
 
 - **How agents are found:** it works whether you start the agent with **Start agent** or type `claude` yourself. It follows `/clear`, `/new` and `/resume`, and it forgets the agent when you quit it.
 - **Missing sessions:** if a session never got a message, so nothing is saved to resume, the agent is started fresh instead.

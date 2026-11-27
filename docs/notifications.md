@@ -2,7 +2,7 @@
 
 Terminal Rooster tells you when something happens in a terminal you aren't looking at:
 
-- **Coding agents:** Claude Code, Codex or Grok finishes its turn, needs an approval, or asks a question.
+- **Coding agents:** Claude Code, Codex, Grok or Antigravity finishes its turn, needs an approval, or asks a question.
 - **Failed commands:** a command exits with an error status, or a terminal's shell does.
 
 In **Settings → Notifications**, each of the two can be **Off**, **Subtle** or **Prominent**. By default, agents are Prominent and failed commands are Subtle.
@@ -19,7 +19,7 @@ No agent needs any setup.
 | Source | What Terminal Rooster reads |
 |---|---|
 | Claude Code | Its terminal title: `◐`/`◑` while it works, `✳` once it is done or waiting for you |
-| Codex | The state it reports to the terminal (`OSC 7501`: working, done, error, waiting for an approval) |
+| Codex, Antigravity | The state they report to the terminal (`OSC 7501`: working, done, error, waiting for an approval or question) |
 | Grok and other programs | Desktop notification requests (`OSC 9`, `OSC 777`, `OSC 99`), progress indicators (`OSC 9;4`), and the bell in a terminal running an agent |
 | Failed commands | The exit status the shell reports after each command (`OSC 133;D`) |
 

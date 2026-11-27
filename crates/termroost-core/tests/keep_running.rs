@@ -33,6 +33,7 @@ fn open(dir: &Path) -> Core {
             claude: agents.join("claude"),
             codex: agents.join("codex"),
             grok: agents.join("grok"),
+            antigravity: agents.join("antigravity"),
         },
         host: Some(host_command()),
         ..Default::default()

@@ -13,6 +13,8 @@ Everything is saved in SQLite as it changes: projects, sessions, split layouts, 
 
 The session's folder is in the right panel's **Files** tab (Ctrl+Shift+F). Click a folder to open or close it, and a file to show it in place of the session's terminals (a strip above them switches between the terminals and the open files). What git ignores (`.gitignore`, `.git/info/exclude`, your global excludes) is dimmed; `.git` itself is not listed. The tree shows changes on disk as they happen; a folder the system can't watch is read again every few seconds instead.
 
+Right-click a tab in the strip (a file, a commit or the uncommitted changes) to **Close** it, **Close other tabs** (keeping that one), or **Close tabs to the left** or **to the right**. Right-clicking **Terminals** offers **Close all other tabs**. **Terminals** itself never closes. Files with unsaved changes are asked about together, in one question.
+
 **+** at the top makes a new file in the session's folder: type its name, then Enter creates and opens it (Escape cancels). A name like `docs/notes.md` makes the folders too. Right-click an entry, or the folder name at the top, for **New file** in that folder (next to a file, for a file) and **Show in Explorer** (on Linux, your default file manager: it selects the file if the file manager supports that, else opens its folder).
 
 ### Editing

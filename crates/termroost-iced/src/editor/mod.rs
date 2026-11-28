@@ -49,6 +49,21 @@ pub const FILE_EDITOR: &str = "file-editor";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DocId(u64);
 
+/// The tab of the strip of open files whose menu is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuOf {
+    Terminals,
+    Doc(DocId),
+}
+
+/// Which tabs beside a tab of the strip its menu closes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+    Both,
+}
+
 /// The files a session has open.
 #[derive(Debug, Default)]
 pub struct SessionFiles {
@@ -194,11 +209,18 @@ pub enum EditorMsg {
     /// Close a file, asking first if it has unsaved changes. Neovim or Vim
     /// is asked to quit instead, and the file closes when it does.
     Close(DocId),
+    /// Close the files on one side of a tab of the strip, or on both (the
+    /// terminals' tab, `None`, has them all on its right), as `Close` would,
+    /// asking once about all those with unsaved changes. The tab is shown
+    /// if the file shown is closed.
+    CloseBeside(Option<DocId>, Side),
+    /// Open the menu of a tab of the strip, or close it (`None`).
+    Menu(Option<MenuOf>),
     /// Neovim or Vim was asked to quit a moment ago: if it hasn't (it has
     /// changes not saved, and says so), show it.
     QuitCheck(DocId),
-    /// Close a file without saving its changes.
-    Discard(DocId),
+    /// Close files without saving their changes.
+    Discard(Vec<DocId>),
     /// A file was read (or can't be edited, and why).
     Loaded(DocId, Result<FileText, String>),
     /// Something done in the editor: typing, moving, selecting, scrolling.
@@ -700,6 +722,9 @@ impl App {
     /// A terminal editor is ended.
     fn close_doc(&mut self, id: DocId) {
         self.open_files_dirty = true;
+        if self.strip_menu == Some(MenuOf::Doc(id)) {
+            self.strip_menu = None;
+        }
         let mut closed = None;
         for files in self.editors.values_mut() {
             let Some(i) = files.open.iter().position(|d| d.id == id) else { continue };
@@ -712,6 +737,46 @@ impl App {
         if let Some(OpenFile { kind: DocKind::Terminal { handle, .. }, .. }) = closed {
             self.core.close_scratch_terminal(handle.pane());
         }
+    }
+
+    /// Closes files, or starts to: Neovim and Vim are asked to quit, and
+    /// one question asks what to do with all the files with unsaved changes.
+    fn close_docs(&mut self, ids: Vec<DocId>) -> Task<Message> {
+        let mut tasks = Vec::new();
+        let mut unsaved = Vec::new();
+        for id in ids {
+            let Some((tab, doc)) = self.doc(id) else { continue };
+            match &doc.kind {
+                DocKind::Terminal { handle, name, .. } if handle.exit_status().is_none() => {
+                    // Its own `:qa`, so changes not saved in it keep it open
+                    // (it says why); the file closes when it ends. Other
+                    // editors are just ended.
+                    if let Some(keys) = external::quit_keys(name) {
+                        handle.write(keys);
+                        tasks.push(quit_check(id));
+                        continue;
+                    }
+                }
+                _ if doc.modified() => {
+                    unsaved.push((id, self.file_label(Some(tab), &doc.path)));
+                    continue;
+                }
+                _ => {}
+            }
+            self.close_doc(id);
+        }
+        if unsaved.is_empty() {
+            tasks.push(self.focus_active());
+        } else {
+            let (docs, names) = unsaved.into_iter().unzip();
+            self.dialog = Some(Dialog::CloseFiles { docs, names });
+        }
+        Task::batch(tasks)
+    }
+
+    /// Closes the menu of a tab of the strip of open files, if one is open.
+    pub(crate) fn close_strip_menu(&mut self) -> bool {
+        self.strip_menu.take().is_some()
     }
 
     /// Writes a file with changes on a thread; `then_close` closes it after.
@@ -766,26 +831,23 @@ impl App {
                 self.focus_active()
             }
             EditorMsg::Close(id) => {
-                let Some((tab, doc)) = self.doc(id) else { return Task::none() };
-                match &doc.kind {
-                    DocKind::Terminal { handle, name, .. } if handle.exit_status().is_none() => {
-                        // Its own `:qa`, so changes not saved in it keep it open
-                        // (it says why); the file closes when it ends. Other
-                        // editors are just ended.
-                        if let Some(keys) = external::quit_keys(name) {
-                            handle.write(keys);
-                            return Task::batch([self.focus_active(), quit_check(id)]);
-                        }
-                    }
-                    _ if doc.modified() => {
-                        let name = self.file_label(Some(tab), &doc.path);
-                        self.dialog = Some(Dialog::CloseFile { doc: id, name });
-                        return Task::none();
-                    }
-                    _ => {}
+                self.strip_menu = None;
+                self.close_docs(vec![id])
+            }
+            EditorMsg::CloseBeside(tab, side) => {
+                self.strip_menu = None;
+                let Some(files) = self.session_files_mut() else { return Task::none() };
+                let open: Vec<DocId> = files.open.iter().map(|d| d.id).collect();
+                let Some(closing) = beside(&open, tab, side) else { return Task::none() };
+                if files.shown.is_some_and(|id| closing.contains(&id)) {
+                    files.shown = tab;
+                    self.open_files_dirty = true;
                 }
-                self.close_doc(id);
-                self.focus_active()
+                self.close_docs(closing)
+            }
+            EditorMsg::Menu(menu) => {
+                self.strip_menu = menu;
+                Task::none()
             }
             EditorMsg::QuitCheck(id) => {
                 let running = |d: &OpenFile| matches!(&d.kind, DocKind::Terminal { handle, .. } if handle.exit_status().is_none());
@@ -796,9 +858,11 @@ impl App {
                 }
                 if Some(tab) == self.active_tab_id() { self.focus_active() } else { Task::none() }
             }
-            EditorMsg::Discard(id) => {
+            EditorMsg::Discard(ids) => {
                 self.dialog = None;
-                self.close_doc(id);
+                for id in ids {
+                    self.close_doc(id);
+                }
                 self.focus_active()
             }
             EditorMsg::Loaded(id, Ok(FileText { decoded, stamp })) => {
@@ -1034,6 +1098,23 @@ impl App {
 const QUIT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// [`EditorMsg::QuitCheck`] once Neovim or Vim had time to quit.
+/// The tabs on `side` of tab `tab` among the `open` files, in order (the
+/// terminals' tab, `None`, is left of them all); `None` if `tab` is closed.
+fn beside(open: &[DocId], tab: Option<DocId>, side: Side) -> Option<Vec<DocId>> {
+    let at = match tab {
+        Some(id) => Some(open.iter().position(|d| *d == id)?),
+        None => None,
+    };
+    let keep = |i: usize| match (side, at) {
+        (Side::Left, None) => true,
+        (_, None) => false,
+        (Side::Left, Some(at)) => i >= at,
+        (Side::Right, Some(at)) => i <= at,
+        (Side::Both, Some(at)) => i == at,
+    };
+    Some(open.iter().enumerate().filter(|&(i, _)| !keep(i)).map(|(_, d)| *d).collect())
+}
+
 fn quit_check(id: DocId) -> Task<Message> {
     let (tx, rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
@@ -1064,4 +1145,26 @@ fn indent(doc: &mut TextDoc, back: bool) -> bool {
     doc.content
         .move_to(Cursor { position: Position { line: at.line, column: at.column.saturating_sub(n) }, selection: None });
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tab_menu_closes_the_tabs_on_its_side() {
+        let [a, b, c] = [DocId(1), DocId(2), DocId(3)];
+        let open = [a, b, c];
+        assert_eq!(beside(&open, Some(b), Side::Left), Some(vec![a]));
+        assert_eq!(beside(&open, Some(b), Side::Right), Some(vec![c]));
+        assert_eq!(beside(&open, Some(b), Side::Both), Some(vec![a, c]));
+        assert_eq!(beside(&open, Some(a), Side::Left), Some(vec![]));
+        assert_eq!(beside(&open, Some(c), Side::Right), Some(vec![]));
+        // The terminals' tab is left of every file.
+        assert_eq!(beside(&open, None, Side::Both), Some(vec![a, b, c]));
+        assert_eq!(beside(&open, None, Side::Right), Some(vec![a, b, c]));
+        assert_eq!(beside(&open, None, Side::Left), Some(vec![]));
+        // A tab closed since its menu opened closes nothing.
+        assert_eq!(beside(&open, Some(DocId(9)), Side::Both), None);
+    }
 }

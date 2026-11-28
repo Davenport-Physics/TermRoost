@@ -1,12 +1,15 @@
 //! The strip of open files above the terminals, and the file shown.
 
-use iced::widget::{Button, Row, button, center, column, container, row, space, text, text_editor, tooltip};
+use iced::widget::{
+    Button, Row, button, center, column, container, mouse_area, row, space, text, text_editor, tooltip,
+};
 use iced::{Alignment, Element, Length, Padding, Theme};
 
 use super::picture::{self, PictureDoc, Zoom};
 use super::text::char_column;
-use super::{Conflict, DocId, DocKind, EditorMsg, FILE_EDITOR, OpenFile, TextDoc, highlight, keys};
+use super::{Conflict, DocId, DocKind, EditorMsg, FILE_EDITOR, MenuOf, OpenFile, Side, TextDoc, highlight, keys};
 use crate::app::{App, Message};
+use crate::context_menu::context_menu;
 use crate::file_icons::{self, Hues, Look};
 use crate::icons::{self, Icon};
 use crate::picture_view::PictureView;
@@ -22,12 +25,14 @@ const TAB_TEXT: f32 = 12.0;
 const TAB_PADDING_Y: f32 = 3.0;
 /// Height of the box a file tab's close button sits at the top of; the
 /// taller it is, the higher the button sits next to the name.
-const CLOSE_BOX: f32 = 19.0;
+const CLOSE_BOX: f32 = 20.0;
+/// Size of the cross on a file tab's close button.
+const CLOSE_ICON: f32 = 12.0;
 
 impl App {
     /// "Terminals", then each file the visible session has open. Nothing
     /// while it has none open.
-    pub(crate) fn view_file_strip(&self) -> Element<'_, Message> {
+    pub(crate) fn view_file_strip<'a>(&'a self) -> Element<'a, Message> {
         let Some(files) = self.session_files().filter(|f| !f.open.is_empty()) else {
             return space::vertical().height(0).into();
         };
@@ -48,7 +53,8 @@ impl App {
             // tab's padding gives up the difference, so the tab keeps its height.
             // It takes its own clicks, so closing doesn't show the file first.
             let ink = |t: &iced::Theme| theme::ink(t).scale_alpha(0.78);
-            let x = button(icons::icon(Icon::Close, 10.0, ink)).padding(1).style(theme::button_ghost).on_press(close);
+            let x =
+                button(icons::icon(Icon::Close, CLOSE_ICON, ink)).padding(2).style(theme::button_ghost).on_press(close);
             let label = row![label, container(x).height(CLOSE_BOX)].spacing(6).align_y(Alignment::Center);
             let padding_y = TAB_PADDING_Y - (CLOSE_BOX - TAB_TEXT * 1.3) / 2.0;
             button(label)
@@ -56,10 +62,16 @@ impl App {
                 .style(style)
                 .on_press(msg)
         };
+        // Right-clicking a tab opens its menu, under it.
+        let with_menu = |tab: Element<'a, Message>, of: MenuOf, at: usize| {
+            let tab = mouse_area(tab).on_right_press(Message::Editor(EditorMsg::Menu(Some(of))));
+            let menu = (self.strip_menu == Some(of)).then(|| tab_menu(of, at, files.open.len()));
+            Element::from(context_menu(tab, menu, Message::Editor(EditorMsg::Menu(None))))
+        };
         let terminals =
             tab("Terminals".into(), None, files.shown.is_none(), Message::Editor(EditorMsg::Show(None)), None);
-        let mut strip = row![terminals].spacing(4).align_y(Alignment::Center);
-        for doc in &files.open {
+        let mut strip = row![with_menu(terminals.into(), MenuOf::Terminals, 0)].spacing(4).align_y(Alignment::Center);
+        for (at, doc) in files.open.iter().enumerate() {
             let mut name = doc.label();
             // A commit or the changes isn't a file, so it has no file icon.
             let look = doc.is_file().then(|| file_icons::file(&name));
@@ -73,7 +85,9 @@ impl App {
                 Message::Editor(EditorMsg::Show(Some(doc.id))),
                 Some(Message::Editor(EditorMsg::Close(doc.id))),
             );
-            strip = strip.push(tip(item, display_dir(&doc.path), tooltip::Position::Bottom));
+            // The menu takes the tooltip's place while it is open.
+            let item = tip(item, display_dir(&doc.path), tooltip::Position::Bottom);
+            strip = strip.push(with_menu(item, MenuOf::Doc(doc.id), at));
         }
         container(column![container(strip.wrap()).padding([5, 8]), ui::divider()]).into()
     }
@@ -161,6 +175,35 @@ fn conflict_banner<'a>(id: DocId, conflict: Option<Conflict>) -> Element<'a, Mes
         ),
     };
     banner(message, buttons, tone)
+}
+
+/// The menu of tab `of` of the strip, `at` among the `open` files (the
+/// terminals' tab is left of them all): what it closes.
+fn tab_menu<'a>(of: MenuOf, at: usize, open: usize) -> Element<'a, Message> {
+    let item = |label: &'static str, msg: EditorMsg| {
+        button(text(label).size(13))
+            .width(Length::Fill)
+            .padding([5, 10])
+            .style(theme::row_button)
+            .on_press(Message::Editor(msg))
+    };
+    let mut items = column![];
+    match of {
+        MenuOf::Terminals => items = items.push(item("Close all other tabs", EditorMsg::CloseBeside(None, Side::Both))),
+        MenuOf::Doc(id) => {
+            items = items.push(item("Close", EditorMsg::Close(id)));
+            if open > 1 {
+                items = items.push(item("Close other tabs", EditorMsg::CloseBeside(Some(id), Side::Both)));
+            }
+            if at > 0 {
+                items = items.push(item("Close tabs to the left", EditorMsg::CloseBeside(Some(id), Side::Left)));
+            }
+            if at + 1 < open {
+                items = items.push(item("Close tabs to the right", EditorMsg::CloseBeside(Some(id), Side::Right)));
+            }
+        }
+    }
+    container(items).padding(4).width(200).style(theme::menu).into()
 }
 
 /// Under a picture whose file was deleted.

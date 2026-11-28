@@ -297,11 +297,28 @@ impl App {
             .button(ui::secondary("Cancel").on_press(Message::DialogCancel))
             .button(ui::secondary("Reload").on_press(Message::Editor(EditorMsg::Reload(*doc))))
             .button(ui::danger("Overwrite").on_press(Message::DialogSubmit)),
-            Dialog::CloseFile { doc, name } => {
-                DialogParts::new(format!("Save the changes to {name}?"), para("If you don't save them, they are lost."))
+            Dialog::CloseFiles { docs, names } => {
+                let (title, body, save): (_, Element<'_, Message>, _) = match names.as_slice() {
+                    [name] => (
+                        format!("Save the changes to {name}?"),
+                        para("If you don't save them, they are lost.").into(),
+                        "Save",
+                    ),
+                    _ => (
+                        format!("Save the changes to {} files?", names.len()),
+                        column![
+                            container(ui::scroll(bullets(names.iter().map(|n| para(n).into())))).max_height(200),
+                            para("If you don't save them, they are lost."),
+                        ]
+                        .spacing(12)
+                        .into(),
+                        "Save all",
+                    ),
+                };
+                DialogParts::new(title, body)
                     .button(ui::secondary("Cancel").on_press(Message::DialogCancel))
-                    .button(ui::danger("Don't save").on_press(Message::Editor(EditorMsg::Discard(*doc))))
-                    .button(ui::primary("Save").on_press(Message::DialogSubmit))
+                    .button(ui::danger("Don't save").on_press(Message::Editor(EditorMsg::Discard(docs.clone()))))
+                    .button(ui::primary(save).on_press(Message::DialogSubmit))
             }
             Dialog::CloseAllNotes => {
                 let n = s.notes.len();

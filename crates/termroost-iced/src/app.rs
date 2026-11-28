@@ -17,7 +17,7 @@ use termroost_core::{
 
 use crate::askpass::{Asks, Prompts};
 use crate::color_picker::{ColorPicker, Hsl};
-use crate::editor::{DocId, EditorMsg, FileEditor, SessionFiles};
+use crate::editor::{DocId, EditorMsg, FileEditor, MenuOf, SessionFiles};
 use crate::files::{FilesMsg, FilesState};
 use crate::git_panel::{GitLog, GitSync, LogRead, SyncOp};
 use crate::git_view::GitViewMsg;
@@ -219,10 +219,10 @@ pub enum Dialog {
         unsaved: Vec<String>,
         dont_ask: bool,
     },
-    /// Closing a file with unsaved changes.
-    CloseFile {
-        doc: DocId,
-        name: String,
+    /// Closing files with unsaved changes (named like "src/main.rs").
+    CloseFiles {
+        docs: Vec<DocId>,
+        names: Vec<String>,
     },
     /// Saving a file that changed on disk since it was read.
     SaveConflict {
@@ -513,6 +513,8 @@ pub struct App {
     pub(crate) files: FilesState,
     /// The files each session has open.
     pub(crate) editors: HashMap<TabId, SessionFiles>,
+    /// The tab of the strip of open files whose menu is open.
+    pub(crate) strip_menu: Option<MenuOf>,
     /// The last id given to an open file.
     pub(crate) next_doc: u64,
     /// The last version number given to the text of an open file.
@@ -645,6 +647,7 @@ impl App {
             task_edit: None,
             files: FilesState::default(),
             editors: HashMap::new(),
+            strip_menu: None,
             next_doc: 0,
             next_version: 0,
             open_files_dirty: false,
@@ -1132,7 +1135,7 @@ impl App {
                 if self.asks.open() {
                     return self.answer_ask(false);
                 }
-                if self.task_drag.take().is_some() || self.close_files_menu() {
+                if self.task_drag.take().is_some() || self.close_files_menu() || self.close_strip_menu() {
                     return Task::none();
                 }
                 if matches!(self.dialog, Some(Dialog::CodexTrust(_))) {
@@ -1181,7 +1184,7 @@ impl App {
                         Dialog::ConfirmDeleteProject(_)
                             | Dialog::ConfirmDeleteTab(_)
                             | Dialog::ConfirmQuit { .. }
-                            | Dialog::CloseFile { .. }
+                            | Dialog::CloseFiles { .. }
                             | Dialog::CloseAllNotes
                     )
                 ) {
@@ -2015,7 +2018,9 @@ impl App {
                 self.dialog = Some(Dialog::Remotes(form));
                 return self.update_remotes(RemotesMsg::Add);
             }
-            Dialog::CloseFile { doc, .. } => return self.save_doc(doc, true, false),
+            Dialog::CloseFiles { docs, .. } => {
+                return Task::batch(docs.into_iter().map(|doc| self.save_doc(doc, true, false)).collect::<Vec<_>>());
+            }
             Dialog::SaveConflict { doc, .. } => return self.update(Message::Editor(EditorMsg::SaveAnyway(doc))),
             Dialog::CloseAllNotes => return self.update(Message::Notes(NotesMsg::CloseAll)),
             Dialog::ConfirmQuit { dont_ask, .. } => {

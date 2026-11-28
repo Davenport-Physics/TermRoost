@@ -3,6 +3,7 @@
 
 mod agent_icon;
 mod app;
+mod askpass;
 mod busy;
 mod color_picker;
 mod context_menu;
@@ -68,6 +69,11 @@ pub fn app_id() -> &'static str {
 }
 
 fn main() -> iced::Result {
+    // Started by git or ssh to ask for a password: ask the running app, which
+    // shows the question (see `askpass`), and say its answer.
+    if let Some(code) = termroost_core::askpass::run_helper() {
+        std::process::exit(code);
+    }
     let data_dir = termroost_core::paths::default_data_dir().ok();
     // A terminal's helper process, or a window of its own (see `host_exe`),
     // not the app.
@@ -148,10 +154,23 @@ fn main() -> iced::Result {
         ..window::Settings::default()
     };
 
+    // git and ssh ask for passwords and passphrases in the app, by starting
+    // this executable (see `askpass`).
+    let prompts = match std::env::current_exe().and_then(termroost_core::askpass::enable) {
+        Ok(prompts) => Some(prompts),
+        Err(e) => {
+            tracing::warn!(error = %e, "git can't ask for passwords in the app");
+            None
+        }
+    };
+
     // `boot` is a `Fn`; hand the already-open core over exactly once.
-    let core = Mutex::new(Some(core));
+    let core = Mutex::new(Some((core, prompts)));
     let mut application = iced::application(
-        move || App::new(core.lock().unwrap().take().expect("boot runs once")),
+        move || {
+            let (core, prompts) = core.lock().unwrap().take().expect("boot runs once");
+            App::new(core, prompts)
+        },
         App::update,
         App::view,
     )

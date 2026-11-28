@@ -99,7 +99,7 @@ impl App {
                     handle.clone(),
                     self.keymap.clone(),
                     self.keyboard_focus.clone(),
-                    self.dialog.is_none(),
+                    self.terminals_take_keys(),
                     self.prefs.font_size,
                     Message::Noop,
                     Message::Noop,

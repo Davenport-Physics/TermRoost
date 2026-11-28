@@ -15,6 +15,7 @@
 
 pub mod agent;
 pub mod alert;
+pub mod askpass;
 pub mod codex_hook;
 pub mod command;
 pub mod detect;

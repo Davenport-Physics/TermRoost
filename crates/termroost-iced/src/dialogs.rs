@@ -24,11 +24,25 @@ pub(crate) struct DialogParts<'a> {
     pub buttons: Vec<Element<'a, Message>>,
     /// Whether the ✕ can be pressed; not while git is busy, for example.
     pub closable: bool,
+    /// What the ✕ (and a click outside, where allowed) does.
+    pub cancel: Message,
 }
 
 impl<'a> DialogParts<'a> {
     pub fn new(title: impl Into<String>, body: impl Into<Element<'a, Message>>) -> Self {
-        DialogParts { title: title.into(), body: body.into(), buttons: Vec::new(), closable: true }
+        DialogParts {
+            title: title.into(),
+            body: body.into(),
+            buttons: Vec::new(),
+            closable: true,
+            cancel: Message::DialogCancel,
+        }
+    }
+
+    /// Makes the ✕ send `cancel` instead of closing `App::dialog`.
+    pub fn on_cancel(mut self, cancel: Message) -> Self {
+        self.cancel = cancel;
+        self
     }
 
     pub fn button(mut self, button: impl Into<Element<'a, Message>>) -> Self {
@@ -69,7 +83,7 @@ fn keep_running<'a>(keep: bool, was: bool) -> Element<'a, Message> {
     column![switch, ui::note(Tone::Warning, para("Saving restarts this terminal."))].spacing(8).into()
 }
 
-fn para<'a>(s: impl text::IntoFragment<'a>) -> text::Text<'a> {
+pub(crate) fn para<'a>(s: impl text::IntoFragment<'a>) -> text::Text<'a> {
     text(s).size(TEXT)
 }
 
@@ -85,11 +99,11 @@ fn bullets<'a>(items: impl Iterator<Item = Element<'a, Message>>) -> Element<'a,
 
 /// A dialog's card: the title and ✕, the content, then the buttons on a
 /// tinted strip. `dismiss_outside` lets a click outside it cancel it.
-fn modal<'a>(parts: DialogParts<'a>, width: f32, dismiss_outside: bool) -> Element<'a, Message> {
+pub(crate) fn modal<'a>(parts: DialogParts<'a>, width: f32, dismiss_outside: bool) -> Element<'a, Message> {
     let close = button(icon(Icon::Close, 14.0, theme::muted))
         .padding(5)
         .style(theme::button_ghost)
-        .on_press_maybe(parts.closable.then_some(Message::DialogCancel));
+        .on_press_maybe(parts.closable.then(|| parts.cancel.clone()));
     let header = row![text(parts.title).size(TEXT_TITLE).font(SEMIBOLD).width(Length::Fill), close]
         .spacing(12)
         .align_y(Alignment::Center)
@@ -105,7 +119,7 @@ fn modal<'a>(parts: DialogParts<'a>, width: f32, dismiss_outside: bool) -> Eleme
     }
     let card = opaque(container(card).width(width).style(theme::modal_card));
     let backdrop = center(card).padding(24).style(theme::modal_backdrop);
-    if dismiss_outside { opaque(mouse_area(backdrop).on_press(Message::DialogCancel)) } else { opaque(backdrop) }
+    if dismiss_outside { opaque(mouse_area(backdrop).on_press(parts.cancel)) } else { opaque(backdrop) }
 }
 
 /// The small Codex window for trusting the hook. Clicking outside does not
@@ -115,9 +129,17 @@ fn codex_window<'a>(
     keymap: &Arc<Keymap>,
     focus: &KeyboardFocus,
     font_size: f32,
+    active: bool,
 ) -> Element<'a, Message> {
-    let term =
-        TerminalView::new(handle.clone(), keymap.clone(), focus.clone(), true, font_size, Message::Noop, Message::Noop);
+    let term = TerminalView::new(
+        handle.clone(),
+        keymap.clone(),
+        focus.clone(),
+        active,
+        font_size,
+        Message::Noop,
+        Message::Noop,
+    );
     let body = column![
         para("Type /hooks and trust the Terminal Rooster hook."),
         container(term).padding(1).height(420).style(theme::terminal_frame),
@@ -287,7 +309,13 @@ impl App {
                 DialogParts::new(title, para("Their text is gone.")).confirm("Close all", true)
             }
             Dialog::CodexTrust(handle) => {
-                return codex_window(handle, &self.keymap, &self.keyboard_focus, self.prefs.font_size);
+                return codex_window(
+                    handle,
+                    &self.keymap,
+                    &self.keyboard_focus,
+                    self.prefs.font_size,
+                    !self.asks.open(),
+                );
             }
             Dialog::Worktree(form) => self.view_worktree(form),
             Dialog::RemoveWorktree(form) => self.view_remove(form),

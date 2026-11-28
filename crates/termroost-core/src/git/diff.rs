@@ -16,7 +16,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use super::ignored::set_aside;
-use super::{Repo, command, git, spawn_error};
+use super::{Repo, command, git, let_ask, spawn_error};
 
 /// How a file changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,7 +344,8 @@ impl Repo {
         if amend {
             args.push("--amend");
         }
-        git_with_input(&self.worktree, &args, message.as_bytes())?;
+        // Signing the commit may need a key's passphrase.
+        run_with_input(let_ask(command(&self.worktree, &args)), &args, message.as_bytes())?;
         let made = git(&self.worktree, &["log", "-1", "--format=%h"]).unwrap_or_default();
         let verb = if amend { "Amended" } else { "Committed" };
         Ok(format!("{verb} {}.", made.trim()))
@@ -743,12 +744,13 @@ fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 
 /// Runs git in `dir` with `input` on its standard input.
 fn git_with_input(dir: &Path, args: &[&str], input: &[u8]) -> Result<String, String> {
-    let mut child = command(dir, args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(spawn_error)?;
+    run_with_input(command(dir, args), args, input)
+}
+
+/// Runs `cmd` (git with `args`) with `input` on its standard input.
+fn run_with_input(mut cmd: std::process::Command, args: &[&str], input: &[u8]) -> Result<String, String> {
+    let mut child =
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(spawn_error)?;
     let mut stdin = child.stdin.take().ok_or("could not write to git")?;
     // Written on a thread: git may answer before it read all of it, and a
     // full pipe would then stall both.

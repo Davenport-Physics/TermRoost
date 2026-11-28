@@ -76,7 +76,9 @@ Its **New worktree** part runs `git worktree add` beside the repository, so on t
 
 For a session in a repository, the right panel has a **Git** tab between **Tasks** and **Files**. It lists the latest 200 commits of the session's branch, or of every branch with **All branches**: subject, id, author, age, and the branches and tags on each. New commits show up on their own within about two seconds. Between commits it only reads the files under `.git` that say where branches and tags point; it runs git only when one of them moved.
 
-Commits that are on no remote yet are marked **not pushed**, and a line says how far the branch is from its upstream ("2 commits to push · 1 to pull (origin/main)", as of the last fetch). **Pull** (with **Rebase**, on by default, which replays your commits on top of what came in instead of merging) and **Push** run git for you; a branch without an upstream is pushed to `origin` and tracks it from then on. git gets 5 minutes for either, so a login prompt it cannot show won't leave it waiting forever.
+Commits that are on no remote yet are marked **not pushed**, and a line says how far the branch is from its upstream ("2 commits to push · 1 to pull (origin/main)", as of the last fetch). **Pull** (with **Rebase**, on by default, which replays your commits on top of what came in instead of merging) and **Push** run git for you; a branch without an upstream is pushed to `origin` and tracks it from then on. git gets 5 minutes for either.
+
+When git or ssh needs something to log in (an SSH key's passphrase, a password, a user name for an HTTPS remote) or asks before connecting to a host it doesn't know yet, Terminal Rooster asks you in a small dialog on top of everything else. This covers pull, push, fetching a remote and committing (signing a commit can need a key's passphrase). Passwords aren't shown as you type them, and if one isn't accepted, the dialog says so when git asks again. Cancel makes git stop and fail. Keys loaded in an ssh-agent and passwords your git credential helper keeps aren't asked for.
 
 ### Commits and changes
 

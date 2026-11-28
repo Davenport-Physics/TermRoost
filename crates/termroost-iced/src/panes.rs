@@ -158,7 +158,7 @@ impl App {
                 h,
                 self.keymap.clone(),
                 self.keyboard_focus.clone(),
-                active && self.dialog.is_none(),
+                active && self.terminals_take_keys(),
                 self.prefs.font_size,
                 Message::FocusPane(pane),
                 Message::RestartPane(pane),

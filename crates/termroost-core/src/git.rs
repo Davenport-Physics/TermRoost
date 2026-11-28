@@ -704,10 +704,12 @@ fn git_program() -> PathBuf {
 }
 
 /// How long a command that talks to a remote may run. It can wait on the
-/// network, or on a login prompt nobody sees: git runs without a console.
+/// network, or on a login: the person answering a password prompt (see
+/// [`crate::askpass`]), or a prompt nobody sees when no front end shows them.
 const REMOTE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// git in `dir`, without a console, never asking anything on a terminal.
+/// It can't ask for passwords either, unless [`let_ask`] lets it.
 fn command(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new(git_program());
     cmd.arg("-C")
@@ -723,6 +725,14 @@ fn command(dir: &Path, args: &[&str]) -> Command {
         cmd.creation_flags(crate::session::shell::CREATE_NO_WINDOW);
     }
     tracing::debug!(dir = %dir.display(), ?args, "running git");
+    cmd
+}
+
+/// Lets git (and the ssh it runs) ask for passwords and passphrases in the
+/// app (see [`crate::askpass`]). Only for commands that run off the UI
+/// thread, which has to be free to show the question.
+fn let_ask(mut cmd: Command) -> Command {
+    crate::askpass::let_ask(&mut cmd);
     cmd
 }
 
@@ -749,10 +759,11 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     outcome(args, out.status, &out.stdout, &out.stderr)
 }
 
-/// Like [`git`], for commands that talk to a remote: stopped after
-/// [`REMOTE_TIMEOUT`].
+/// Like [`git`], for commands that talk to a remote: they may ask for a
+/// login (see [`let_ask`]), and are stopped after [`REMOTE_TIMEOUT`].
 fn git_remote(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let mut child = command(dir, args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(spawn_error)?;
+    let mut child =
+        let_ask(command(dir, args)).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(spawn_error)?;
     // Both pipes are read on threads, so a full pipe can't stall git.
     fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
         std::thread::spawn(move || {

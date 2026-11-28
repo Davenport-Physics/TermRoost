@@ -15,6 +15,7 @@ use termroost_core::{
     Activity, AgentKind, Axis, Command, Core, Event, GroupId, NoteId, Outcome, PaneId, ProjectId, TabId, TaskId, git,
 };
 
+use crate::askpass::{Asks, Prompts};
 use crate::color_picker::{ColorPicker, Hsl};
 use crate::editor::{DocId, EditorMsg, FileEditor, SessionFiles};
 use crate::files::{FilesMsg, FilesState};
@@ -353,6 +354,12 @@ pub enum Message {
     RemoveCodexHook,
     /// Open the Codex window to trust the hook.
     TrustCodexHook,
+    /// git or ssh asks for a password, a passphrase or a yes (see `askpass`).
+    AskPass(termroost_core::askpass::Prompt),
+    /// What is typed in answer (never logged).
+    AskPassInput(String),
+    /// Answer the question on screen, or (`false`) cancel it.
+    AskPassAnswer(bool),
     Noop,
     SystemTheme(iced::theme::Mode),
     FollowSystem(bool),
@@ -496,6 +503,10 @@ pub struct App {
     /// The projects list shows only projects matching this.
     pub(crate) project_search: String,
     pub(crate) dialog: Option<Dialog>,
+    /// Questions from git and ssh, shown above any dialog.
+    pub(crate) asks: Asks,
+    /// Where they arrive; `None` if git can't ask here.
+    askpass: Option<async_channel::Receiver<termroost_core::askpass::Prompt>>,
     pub(crate) new_task: String,
     pub(crate) task_edit: Option<(TaskId, String)>,
     /// The folders read for the Files tab.
@@ -611,7 +622,10 @@ impl Hash for Clicks {
 }
 
 impl App {
-    pub fn new(core: Core) -> (App, Task<Message>) {
+    pub fn new(
+        core: Core,
+        askpass: Option<async_channel::Receiver<termroost_core::askpass::Prompt>>,
+    ) -> (App, Task<Message>) {
         let prefs = Prefs::load(&core);
         let themes = ThemeStore::load(&core);
         let keymap = Arc::new(Keymap::new(&prefs.shortcuts));
@@ -625,6 +639,8 @@ impl App {
             rename: None,
             project_search: String::new(),
             dialog: None,
+            asks: Asks::default(),
+            askpass,
             new_task: String::new(),
             task_edit: None,
             files: FilesState::default(),
@@ -772,6 +788,9 @@ impl App {
             }),
             iced::time::every(GIT_POLL).map(|_| Message::GitPoll),
         ];
+        if let Some(prompts) = &self.askpass {
+            subs.push(Subscription::run_with(Prompts(prompts.clone()), |p| p.0.clone()).map(Message::AskPass));
+        }
         if self.files_shown() {
             subs.push(
                 Subscription::run_with(self.files.watch.changes(), |c| c.0.clone())
@@ -891,7 +910,7 @@ impl App {
     /// Moves keyboard focus to the focused terminal of the visible tab, or to
     /// the file shown in place of its terminals.
     pub(crate) fn focus_active(&self) -> Task<Message> {
-        if self.dialog.is_some() || self.rename.is_some() || self.task_edit.is_some() {
+        if self.dialog.is_some() || self.asks.open() || self.rename.is_some() || self.task_edit.is_some() {
             return Task::none();
         }
         if let Some(focus) = self.focus_doc() {
@@ -978,6 +997,7 @@ impl App {
             Message::Core(_)
             | Message::Tick
             | Message::Key(_)
+            | Message::AskPassInput(_)
             | Message::Files(FilesMsg::Listed(_) | FilesMsg::Changed(_) | FilesMsg::NewFileName(_)) => true,
             Message::Editor(msg) => !msg.loggable(),
             Message::Notes(msg) => !msg.loggable(),
@@ -1109,6 +1129,9 @@ impl App {
                 return self.quit();
             }
             Message::Escape => {
+                if self.asks.open() {
+                    return self.answer_ask(false);
+                }
                 if self.task_drag.take().is_some() || self.close_files_menu() {
                     return Task::none();
                 }
@@ -1146,6 +1169,11 @@ impl App {
                 }
             }
             Message::Enter => {
+                // A question's field submits itself; Enter must not also
+                // confirm a dialog under it. A yes is clicked, not typed.
+                if self.asks.open() {
+                    return Task::none();
+                }
                 // Dialogs with text fields submit through the fields themselves.
                 if matches!(
                     self.dialog,
@@ -1161,6 +1189,10 @@ impl App {
                 }
             }
             Message::TabKey { shift } => {
+                // Moving on would reach the fields of a dialog under the question.
+                if self.asks.open() {
+                    return self.focus_ask();
+                }
                 if self.dialog.is_some() && !matches!(self.dialog, Some(Dialog::CodexTrust(_))) {
                     return if shift { operation::focus_previous() } else { operation::focus_next() };
                 }
@@ -1598,6 +1630,9 @@ impl App {
                     fill_name_from_dir(name, dir);
                 }
             }
+            Message::AskPass(prompt) => return self.ask(prompt),
+            Message::AskPassInput(input) => self.ask_input(input),
+            Message::AskPassAnswer(ok) => return self.answer_ask(ok),
             Message::DialogSubmit => return self.submit_dialog(),
             Message::DialogCancel => {
                 match &self.dialog {
@@ -2230,7 +2265,7 @@ impl App {
     }
 
     fn shortcut(&mut self, action: Action) -> Task<Message> {
-        if self.dialog.is_some() || self.settings.is_some() {
+        if self.dialog.is_some() || self.asks.open() || self.settings.is_some() {
             return Task::none();
         }
         // With a file in place of the terminals, terminal shortcuts don't act
@@ -2360,10 +2395,20 @@ impl App {
         };
         let base: Element<'_, Message> =
             if self.toasts.is_empty() { base } else { stack![base, self.view_toasts()].into() };
-        match &self.dialog {
+        let base: Element<'_, Message> = match &self.dialog {
             Some(d) => stack![base, self.view_dialog(d)].into(),
+            None => base,
+        };
+        match self.view_ask() {
+            Some(ask) => stack![base, ask].into(),
             None => column![base].into(),
         }
+    }
+
+    /// Whether terminals take the keyboard: not while a dialog or one of
+    /// git's questions is open, so nothing typed there reaches a program.
+    pub(crate) fn terminals_take_keys(&self) -> bool {
+        self.dialog.is_none() && !self.asks.open()
     }
 }
 
